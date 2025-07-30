@@ -335,22 +335,135 @@ func (e *DebugExecutor) ParsePredicate(predicate any) string {
 		panic(fmt.Sprintf("failed to parse predicate: %v", err))
 	}
 
-	// Handle different AST node types
-	switch n := node.(type) {
-	case *ast.FuncLit:
-		// Direct function literal
-		//return e.astToSQL(n)
-	case *ast.Ident:
-		// Variable reference - this shouldn't happen for inline lambdas
-		panic(fmt.Sprintf("unexpected identifier in predicate: %s", n.Name))
-	default:
-		// Try to find the function literal within the expression
-		if funcLit := findFuncLit(n); funcLit != nil {
-			//return e.astToSQL(funcLit)
-		}
-		panic(fmt.Sprintf("unsupported predicate AST node type: %T", n))
+	// Get function type to determine entity type
+	funcType := reflect.TypeOf(predicate)
+	entityType := funcType.In(0)
+
+	// Handle pointer types by dereferencing
+	if entityType.Kind() == reflect.Ptr {
+		entityType = entityType.Elem()
 	}
-	return ""
+
+	// Find the function literal
+	funcLit := findFuncLit(node)
+	if funcLit == nil {
+		panic("no function literal found in predicate")
+	}
+
+	// Parse the function body to extract conditions that return true
+	conditions := e.extractTrueConditions(funcLit, entityType)
+
+	if len(conditions) == 0 {
+		return "1 = 1" // Always true if no conditions found
+	}
+
+	// Join multiple conditions with OR
+	return strings.Join(conditions, " OR ")
+}
+
+// extractTrueConditions extracts all conditions that lead to returning true
+func (e *DebugExecutor) extractTrueConditions(funcLit *ast.FuncLit, entityType reflect.Type) []string {
+	var conditions []string
+
+	// Process each statement in the function body
+	for _, stmt := range funcLit.Body.List {
+		switch s := stmt.(type) {
+		case *ast.IfStmt:
+			// Handle if statement that returns true
+			if e.returnsTrue(s.Body) {
+				condition := e.exprToSQL(s.Cond, entityType)
+				conditions = append(conditions, fmt.Sprintf("(%s)", condition))
+			}
+
+			// Handle else if and else clauses
+			if s.Else != nil {
+				elseConditions := e.extractElseConditions(s.Else, entityType)
+				conditions = append(conditions, elseConditions...)
+			}
+
+		case *ast.ReturnStmt:
+			// Handle direct return with condition, but ignore "return false"
+			if len(s.Results) == 1 {
+				if e.isAlwaysFalse(s.Results[0]) {
+					// Skip "return false" statements
+					continue
+				}
+
+				if e.isAlwaysTrue(s.Results[0]) {
+					conditions = append(conditions, "1 = 1")
+				} else {
+					// This might be a complex boolean expression
+					condition := e.exprToSQL(s.Results[0], entityType)
+					conditions = append(conditions, fmt.Sprintf("(%s)", condition))
+				}
+			}
+		}
+	}
+
+	return conditions
+}
+
+// extractElseConditions handles else and else if clauses
+func (e *DebugExecutor) extractElseConditions(elseStmt ast.Stmt, entityType reflect.Type) []string {
+	var conditions []string
+
+	switch els := elseStmt.(type) {
+	case *ast.BlockStmt:
+		// Simple else block
+		if e.returnsTrue(els) {
+			// This else block returns true, but we need to negate all previous conditions
+			// For now, we'll skip this case as it's complex
+		}
+
+	case *ast.IfStmt:
+		// Else if
+		if e.returnsTrue(els.Body) {
+			condition := e.exprToSQL(els.Cond, entityType)
+			conditions = append(conditions, fmt.Sprintf("(%s)", condition))
+		}
+
+		// Recursively handle nested else
+		if els.Else != nil {
+			nestedConditions := e.extractElseConditions(els.Else, entityType)
+			conditions = append(conditions, nestedConditions...)
+		}
+	}
+
+	return conditions
+}
+
+// returnsTrue checks if a block statement returns true
+func (e *DebugExecutor) returnsTrue(block *ast.BlockStmt) bool {
+	for _, stmt := range block.List {
+		if retStmt, ok := stmt.(*ast.ReturnStmt); ok {
+			if len(retStmt.Results) == 1 {
+				return e.isAlwaysTrue(retStmt.Results[0])
+			}
+		}
+	}
+	return false
+}
+
+// isAlwaysTrue checks if an expression always evaluates to true
+func (e *DebugExecutor) isAlwaysTrue(expr ast.Expr) bool {
+	switch v := expr.(type) {
+	case *ast.Ident:
+		return v.Name == "true"
+	case *ast.BasicLit:
+		return v.Kind == token.INT && v.Value != "0"
+	}
+	return false
+}
+
+// isAlwaysFalse checks if an expression always evaluates to false
+func (e *DebugExecutor) isAlwaysFalse(expr ast.Expr) bool {
+	switch v := expr.(type) {
+	case *ast.Ident:
+		return v.Name == "false"
+	case *ast.BasicLit:
+		return v.Kind == token.INT && v.Value == "0"
+	}
+	return false
 }
 
 // findFuncLit recursively searches for a function literal in an AST node

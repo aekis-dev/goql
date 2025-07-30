@@ -660,186 +660,180 @@ func (ctx *ColtContext) Delete(args ...any) (int64, error) {
 		return 0, fmt.Errorf("Delete requires at least one argument")
 	}
 
-	if len(args) > 1 {
-		return 0, fmt.Errorf("Delete requires exactly one argument")
-	}
+	var totalAffected int64
 
-	// Get the argument
-	arg := args[0]
-	argType := reflect.TypeOf(arg)
-	argValue := reflect.ValueOf(arg)
+	// Use transaction for all operations
+	err := ctx.Transaction(func(tx *ColtContext) error {
+		// Process each argument individually
+		for i, arg := range args {
+			argType := reflect.TypeOf(arg)
+			argValue := reflect.ValueOf(arg)
 
-	// Case 1: Entity or slice of entities
-	if entity, ok := arg.(Entity); ok {
-		// Single entity - convert to slice
-		arg = []Entity{entity}
-		argValue = reflect.ValueOf(arg)
-	}
+			switch {
+			// Case 1: Single entity or slice of entities
+			case isEntity(arg) || argValue.Kind() == reflect.Slice:
+				var entities []Entity
 
-	if argValue.Kind() == reflect.Slice {
-		// Handle slice of entities (either original slice or converted single entity)
-		sliceLen := argValue.Len()
-		if sliceLen == 0 {
-			return 0, nil
-		}
-
-		// Collect all entities and their primary keys
-		type entityKey struct {
-			entity    Entity
-			tableName string
-			pkColumn  string
-			pkValue   any
-		}
-
-		entityKeys := make([]entityKey, 0, sliceLen)
-
-		// Verify all elements are entities and collect their keys
-		for i := 0; i < sliceLen; i++ {
-			elem := argValue.Index(i).Interface()
-			entity, ok := elem.(Entity)
-			if !ok {
-				return 0, fmt.Errorf("slice element %d is not an Entity", i)
-			}
-
-			pkColumn, pkValue := entity.PrimaryKey()
-			if pkValue == nil {
-				return 0, fmt.Errorf("entity %d has nil primary key", i)
-			}
-
-			entityKeys = append(entityKeys, entityKey{
-				entity:    entity,
-				tableName: entity.TableName(),
-				pkColumn:  pkColumn,
-				pkValue:   pkValue,
-			})
-		}
-
-		// Group entities by table for efficient deletion
-		tableGroups := make(map[string][]entityKey)
-		for _, ek := range entityKeys {
-			tableGroups[ek.tableName] = append(tableGroups[ek.tableName], ek)
-		}
-
-		var totalAffected int64
-
-		// Use transaction for multiple deletes
-		err := ctx.Transaction(func(tx *ColtContext) error {
-			for tableName, group := range tableGroups {
-				if len(group) == 1 {
-					// Single entity deletion
-					sql := fmt.Sprintf("DELETE FROM %s WHERE %s = ?",
-						tableName,
-						group[0].pkColumn,
-					)
-
-					result, err := tx.exec(sql, group[0].pkValue)
-					if err != nil {
-						return fmt.Errorf("failed to delete entity from %s: %w", tableName, err)
-					}
-
-					affected, err := result.RowsAffected()
-					if err != nil {
-						return err
-					}
-					totalAffected += affected
-
+				if isEntity(arg) {
+					// Single entity
+					entity := arg.(Entity)
+					entities = append(entities, entity)
 				} else {
-					// Batch deletion using IN clause
-					// Collect all primary key values
-					pkValues := make([]any, len(group))
-					placeholders := make([]string, len(group))
-
-					for i, ek := range group {
-						pkValues[i] = ek.pkValue
-						placeholders[i] = "?"
+					// Slice of entities
+					sliceLen := argValue.Len()
+					if sliceLen == 0 {
+						continue
 					}
 
-					sql := fmt.Sprintf("DELETE FROM %s WHERE %s IN (%s)",
-						tableName,
-						group[0].pkColumn, // All entities in group have same pk column
-						strings.Join(placeholders, ", "),
-					)
-
-					result, err := tx.exec(sql, pkValues...)
-					if err != nil {
-						return fmt.Errorf("failed to batch delete from %s: %w", tableName, err)
-					}
-
-					affected, err := result.RowsAffected()
-					if err != nil {
-						return err
-					}
-					totalAffected += affected
-				}
-
-				// Call any delete hooks if entities implement them
-				for _, ek := range group {
-					if deletable, ok := ek.entity.(interface{ OnDelete() }); ok {
-						deletable.OnDelete()
+					for j := 0; j < sliceLen; j++ {
+						elem := argValue.Index(j).Interface()
+						entity, ok := elem.(Entity)
+						if !ok {
+							return fmt.Errorf("slice element %d in argument %d is not an Entity", j, i)
+						}
+						entities = append(entities, entity)
 					}
 				}
+
+				// Delete entities by primary key
+				if len(entities) > 0 {
+					// Collect all entities and their primary keys
+					type entityKey struct {
+						entity    Entity
+						tableName string
+						pkColumn  string
+						pkValue   any
+					}
+
+					entityKeys := make([]entityKey, 0, len(entities))
+
+					// Verify all elements are entities and collect their keys
+					for j, entity := range entities {
+						pkColumn, pkValue := entity.PrimaryKey()
+						if pkValue == nil {
+							return fmt.Errorf("entity %d has nil primary key", j)
+						}
+
+						entityKeys = append(entityKeys, entityKey{
+							entity:    entity,
+							tableName: entity.TableName(),
+							pkColumn:  pkColumn,
+							pkValue:   pkValue,
+						})
+					}
+
+					// Group entities by table for efficient deletion
+					tableGroups := make(map[string][]entityKey)
+					for _, ek := range entityKeys {
+						tableGroups[ek.tableName] = append(tableGroups[ek.tableName], ek)
+					}
+
+					// Delete from each table
+					for tableName, group := range tableGroups {
+						// Collect primary key values for IN clause
+						var pkValues []any
+						var placeholders []string
+
+						for _, ek := range group {
+							pkValues = append(pkValues, ek.pkValue)
+							placeholders = append(placeholders, "?")
+						}
+
+						// Use the primary key column from the first entity in the group
+						pkColumn := group[0].pkColumn
+
+						// Build DELETE statement with IN clause
+						sql := fmt.Sprintf("DELETE FROM %s WHERE %s IN (%s)",
+							tableName, pkColumn, strings.Join(placeholders, ", "))
+
+						if ctx.debugMode {
+							log.Printf("Delete entities SQL: %s\n Values: %v", sql, pkValues)
+						}
+
+						result, err := tx.exec(sql, pkValues...)
+						if err != nil {
+							return fmt.Errorf("failed to delete from table %s: %w", tableName, err)
+						}
+
+						affected, err := result.RowsAffected()
+						if err != nil {
+							return fmt.Errorf("failed to get affected rows for table %s: %w", tableName, err)
+						}
+
+						totalAffected += affected
+					}
+				}
+
+			// Case 2: Lambda function for predicate-based deletion
+			case argType.Kind() == reflect.Func:
+				// Validate predicate function signature
+				if argType.NumIn() != 1 || argType.NumOut() != 1 {
+					return fmt.Errorf("predicate at argument %d must have signature func(T) bool", i)
+				}
+
+				if argType.Out(0).Kind() != reflect.Bool {
+					return fmt.Errorf("predicate at argument %d must return bool", i)
+				}
+
+				// Get entity type from predicate parameter
+				entityType := argType.In(0)
+
+				// Handle pointer types by dereferencing
+				if entityType.Kind() == reflect.Ptr {
+					entityType = entityType.Elem()
+				}
+
+				// Create a temporary instance to get table name
+				tempEntity := reflect.New(entityType).Interface()
+				entity, ok := tempEntity.(Entity)
+				if !ok {
+					return fmt.Errorf("type %v does not implement Entity interface", entityType)
+				}
+
+				tableName := entity.TableName()
+
+				// Parse predicate to SQL WHERE clause
+				whereClause := tx.executor.ParsePredicate(arg)
+
+				// Build DELETE statement
+				sql := fmt.Sprintf("DELETE FROM %s WHERE %s", tableName, whereClause)
+
+				// Log in debug mode
+				if ctx.debugMode {
+					log.Printf("Batch delete SQL: %s", sql)
+				}
+
+				// Execute batch delete
+				result, err := tx.exec(sql)
+				if err != nil {
+					return fmt.Errorf("failed to execute batch delete at argument %d: %w", i, err)
+				}
+
+				affected, err := result.RowsAffected()
+				if err != nil {
+					return fmt.Errorf("failed to get affected rows at argument %d: %w", i, err)
+				}
+
+				totalAffected += affected
+
+				// Log affected rows in debug mode
+				if ctx.debugMode {
+					log.Printf("Deleted %d rows from %s", affected, tableName)
+				}
+
+			default:
+				return fmt.Errorf("unsupported argument type %T at position %d", arg, i)
 			}
+		}
 
-			return nil
-		})
+		return nil
+	})
 
-		return totalAffected, err
+	if err != nil {
+		return 0, err
 	}
 
-	// Case 2: Predicate-based deletion
-	if argType.Kind() == reflect.Func {
-		// Validate predicate function signature
-		if argType.NumIn() != 1 || argType.NumOut() != 1 {
-			return 0, fmt.Errorf("predicate must have signature func(T) bool")
-		}
-
-		if argType.Out(0).Kind() != reflect.Bool {
-			return 0, fmt.Errorf("predicate must return bool")
-		}
-
-		// Get entity type from predicate parameter
-		entityType := argType.In(0)
-
-		// Create a temporary instance to get table name
-		tempEntity := reflect.New(entityType).Interface()
-		entity, ok := tempEntity.(Entity)
-		if !ok {
-			return 0, fmt.Errorf("type %v does not implement Entity interface", entityType)
-		}
-
-		tableName := entity.TableName()
-
-		// Parse predicate to SQL WHERE clause
-		whereClause := ctx.executor.ParsePredicate(arg)
-
-		// Build DELETE statement
-		sql := fmt.Sprintf("DELETE FROM %s WHERE %s", tableName, whereClause)
-
-		// Log in debug mode
-		if ctx.debugMode {
-			log.Printf("🗑️ Batch delete SQL: %s", sql)
-		}
-
-		// Execute batch delete
-		result, err := ctx.exec(sql)
-		if err != nil {
-			return 0, fmt.Errorf("failed to execute batch delete: %w", err)
-		}
-
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return 0, err
-		}
-
-		// Log affected rows in debug mode
-		if ctx.debugMode {
-			log.Printf("🗑️ Deleted %d rows from %s", affected, tableName)
-		}
-
-		return affected, nil
-	}
-
-	return 0, fmt.Errorf("Delete: unsupported argument type %T", arg)
+	return totalAffected, nil
 }
 
 // Transaction support
