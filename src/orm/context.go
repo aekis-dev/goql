@@ -565,8 +565,9 @@ func (ctx *ColtContext) Write(args ...any) (int64, error) {
 				}
 
 				entityType := argType.In(0)
+				// Handle pointer types by dereferencing to get the underlying type
 				if entityType.Kind() == reflect.Ptr {
-					return fmt.Errorf("conditional function at argument %d parameter must be value type, not pointer", i)
+					entityType = entityType.Elem()
 				}
 
 				// Create temporary entity to get table name
@@ -586,10 +587,35 @@ func (ctx *ColtContext) Write(args ...any) (int64, error) {
 
 				// Execute each conditional update
 				for _, update := range conditionalUpdates {
-					sql := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
-						tableName,
-						strings.Join(update.SetClauses, ", "),
-						update.WhereClause)
+					var sql string
+					if len(update.JoinInfos) > 0 {
+						// Build UPDATE with FROM syntax for SQLite
+						var fromTables []string
+						var whereConditions []string
+
+						for _, joinInfo := range update.JoinInfos {
+							fromTables = append(fromTables, joinInfo.BuildUpdateFrom())
+							whereConditions = append(whereConditions, joinInfo.BuildUpdateWhere(tableName))
+						}
+
+						// Combine WHERE conditions
+						allWhereConditions := whereConditions
+						if update.WhereClause != "" {
+							allWhereConditions = append(allWhereConditions, update.WhereClause)
+						}
+
+						sql = fmt.Sprintf("UPDATE %s SET %s FROM %s WHERE %s",
+							tableName,
+							strings.Join(update.SetClauses, ", "),
+							strings.Join(fromTables, ", "),
+							strings.Join(allWhereConditions, " AND "))
+					} else {
+						// Simple UPDATE without joins
+						sql = fmt.Sprintf("UPDATE %s SET %s WHERE %s",
+							tableName,
+							strings.Join(update.SetClauses, ", "),
+							update.WhereClause)
+					}
 
 					if ctx.debugMode {
 						log.Printf("Update by lambda func SQL: %s\n Values: %v", sql, update.Values)

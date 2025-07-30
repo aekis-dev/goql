@@ -144,6 +144,10 @@ func (r *Registry) parseFields(t reflect.Type, schema *TableSchema, prefix strin
 		if fieldSchema.PrimaryKey {
 			schema.PrimaryKey = fieldSchema
 		}
+
+		if fieldSchema.Relation != nil {
+			schema.Relations[fieldName] = fieldSchema.Relation
+		}
 	}
 	return nil
 }
