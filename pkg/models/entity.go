@@ -1,13 +1,9 @@
-package orm
+package models
 
 // Entity is the core interface that all ORM models must implement
 type Entity interface {
-	// TableName returns the database table name for this entity
-	TableName() string
-
 	// PrimaryKey returns the column name and value of the primary key
 	PrimaryKey() (string, any)
-
 	SetPrimaryKey(int64)
 }
 

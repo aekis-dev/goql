@@ -1,0 +1,235 @@
+//go:build ignore
+
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/token"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+
+	_ "github.com/aekis/goql/src/models"
+	"github.com/aekis/goql/src/orm"
+)
+
+func main() {
+	// Target directory — default to pkg root
+	dir := "../../"
+	if len(os.Args) > 1 {
+		dir = os.Args[1]
+	}
+
+	g := &generator{
+		fset:     token.NewFileSet(),
+		executor: &orm.DebugExecutor{},
+		bodies:   make(map[string]*orm.ParseBody),
+		comments: make(map[string]string),
+	}
+
+	if err := g.walkDir(dir); err != nil {
+		log.Fatalf("goqlc: walk error: %v", err)
+	}
+
+	if len(g.bodies) == 0 {
+		fmt.Println("goqlc: no lambdas found")
+		return
+	}
+
+	if err := g.emit(dir); err != nil {
+		log.Fatalf("goqlc: emit error: %v", err)
+	}
+
+	fmt.Printf("goqlc: compiled %d bodies → goql_registry_prod.go\n", len(g.bodies))
+}
+
+type generator struct {
+	fset     *token.FileSet
+	executor *orm.DebugExecutor
+	bodies   map[string]*orm.ParseBody
+	comments map[string]string // key → human readable location
+	pkgName  string
+}
+
+func (g *generator) walkDir(dir string) error {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("failed to resolve path: %w", err)
+	}
+	fmt.Printf("goqlc: walking %s\n", absDir)
+
+	return filepath.Walk(absDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			// Skip hidden dirs, vendor, generated dirs
+			base := filepath.Base(path)
+			if path != absDir {
+				if base == "vendor" || base == "generator" || strings.HasPrefix(base, ".") {
+					fmt.Printf("goqlc: skipping dir %s\n", path)
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") ||
+			strings.HasSuffix(path, "_test.go") ||
+			strings.HasSuffix(path, "_prod.go") ||
+			filepath.Base(path) == "goql_registry_prod.go" {
+			return nil
+		}
+		fmt.Printf("goqlc: processing %s\n", path)
+		return g.processFile(path)
+	})
+}
+
+func (g *generator) processFile(path string) error {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	file, err := parser.ParseFile(g.fset, path, src, 0)
+	if err != nil {
+		log.Printf("goqlc: skipping %s: %v", path, err)
+		return nil
+	}
+
+	if g.pkgName == "" && file.Name.Name != "main" {
+		g.pkgName = file.Name.Name
+	}
+
+	pkgName := file.Name.Name
+
+	// Walk all top-level function declarations
+	for _, decl := range file.Decls {
+		funcDecl, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+
+		// "main.main" or "orm.FuncName" etc — matches runtime.FuncForPC format
+		enclosing := fmt.Sprintf("%s.%s", pkgName, funcDecl.Name.Name)
+
+		// First pass — find which FuncLits are ORM call arguments
+		ormCalls := make(map[*ast.FuncLit]string) // funcLit → method name
+		ast.Inspect(funcDecl.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			// Look for ctx.Search / ctx.Write / ctx.Delete
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			method := sel.Sel.Name
+			if method != "Search" && method != "Write" && method != "Delete" {
+				return true
+			}
+			for _, arg := range call.Args {
+				if fl, ok := arg.(*ast.FuncLit); ok {
+					ormCalls[fl] = method
+				}
+			}
+			return true
+		})
+
+		if len(ormCalls) == 0 {
+			continue
+		}
+
+		// Second pass — number ALL FuncLits in order to get correct funcN index
+		// The Go compiler assigns funcN sequentially to every FuncLit in the function
+		funcLitIndex := 0
+		ast.Inspect(funcDecl.Body, func(n ast.Node) bool {
+			fl, ok := n.(*ast.FuncLit)
+			if !ok {
+				return true
+			}
+
+			funcLitIndex++
+			runtimeName := fmt.Sprintf("%s.func%d", enclosing, funcLitIndex)
+
+			method, isORM := ormCalls[fl]
+			if !isORM {
+				return true
+			}
+
+			startPos := g.fset.Position(fl.Pos())
+			endPos := g.fset.Position(fl.End())
+			if startPos.Offset >= endPos.Offset || endPos.Offset > len(src) {
+				return true
+			}
+			lambdaSrc := string(src[startPos.Offset:endPos.Offset])
+
+			key := g.computeKey(runtimeName)
+			preview := strings.ReplaceAll(lambdaSrc[:min(40, len(lambdaSrc))], "\n", " ")
+			preview = strings.ReplaceAll(preview, "\t", " ")
+			comment := fmt.Sprintf("%s at %s:%d — %s...", method, filepath.Base(path), startPos.Line, preview)
+
+			body, err := g.executor.ParseBodyFromSource(lambdaSrc)
+			if err != nil {
+				log.Printf("goqlc: skipping lambda at %s:%d: %v",
+					filepath.Base(path), startPos.Line, err)
+				return true
+			}
+
+			g.bodies[key] = body
+			g.comments[key] = comment
+			return true
+		})
+	}
+
+	return nil
+}
+
+func (g *generator) computeKey(runtimeName string) string {
+	sum := sha256.Sum256([]byte(runtimeName))
+	return fmt.Sprintf("%x", sum[:8])
+}
+
+func (g *generator) emit(dir string) error {
+	var buf bytes.Buffer
+
+	buf.WriteString("// Code generated by goqlc. DO NOT EDIT.\n")
+	buf.WriteString("//go:build prod\n\n")
+	buf.WriteString("package main\n\n")
+	buf.WriteString("import \"github.com/aekis/goql/pkg/orm\"\n\n")
+	buf.WriteString("func init() {\n")
+
+	// Emit predicates
+	for key, body := range g.bodies {
+		buf.WriteString(fmt.Sprintf("\t// %s\n", g.comments[key]))
+		buf.WriteString(fmt.Sprintf("\torm.RegisterBody(%q,\n\t\t%s,\n\t)\n\n",
+			key, emitParsedBody(body, 2)))
+	}
+
+	buf.WriteString("}\n")
+
+	// Format the generated Go code
+	formatted, err := format.Source(buf.Bytes())
+	if err != nil {
+		log.Printf("goqlc: generated code has syntax errors: %v\nRaw output:\n%s",
+			err, buf.String())
+		formatted = buf.Bytes()
+	}
+
+	outPath := filepath.Join(dir, "goql_registry_prod.go")
+	return os.WriteFile(outPath, formatted, 0644)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

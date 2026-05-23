@@ -4,50 +4,21 @@ import (
 	"reflect"
 	"sync"
 	"time"
-	"unsafe"
+
+	"github.com/aekis/goql/pkg/models"
 )
 
 // Model is the base struct for all ORM entities
 type Model struct {
-	ID int64 `colt:
-        column: id
-        primaryKey: true
-        autoIncrement: true
-        type: integer`
-
-	CreatedAt time.Time `colt:
-        column: created_at
-        type: timestamp
-        precision: 6
-        autoCreateTime: true
-        nullable: false
-        default: CURRENT_TIMESTAMP`
-
-	UpdatedAt time.Time `colt:
-        column: updated_at
-        type: timestamp  
-        precision: 6
-        autoUpdateTime: true
-        nullable: false
-        default: CURRENT_TIMESTAMP`
-
-	DeletedAt *time.Time `colt:
-        column: deleted_at
-        type: timestamp
-        precision: 6
-        index: idx_deleted_at
-        nullable: true`
-
+	ID        int64
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	DeletedAt *time.Time
 	// Change tracking fields (not persisted)
-	mu       sync.RWMutex   `colt:"-" json:"-"`
-	original map[string]any `colt:"-" json:"-"`
-	changes  map[string]any `colt:"-" json:"-"`
-	isNew    bool           `colt:"-" json:"-"`
-}
-
-// TableName must be overridden by embedding structs
-func (m *Model) TableName() string {
-	panic("TableName() must be implemented by the embedding struct")
+	mu       sync.RWMutex   `goql:"-" json:"-"`
+	original map[string]any `goql:"-" json:"-"`
+	changes  map[string]any `goql:"-" json:"-"`
+	isNew    bool           `goql:"-" json:"-"`
 }
 
 // PrimaryKey returns the default primary key
@@ -57,7 +28,7 @@ func (m *Model) PrimaryKey() (string, any) {
 
 func (m *Model) SetPrimaryKey(pk int64) {
 	v := reflect.ValueOf(m).Elem()
-	schema, err := GetSchema(m)
+	schema, err := models.GetModel(m)
 	if err != nil || schema == nil {
 		// Fallback to setting ID field directly
 		m.ID = pk
@@ -65,13 +36,13 @@ func (m *Model) SetPrimaryKey(pk int64) {
 	}
 
 	if schema.PrimaryKey != nil {
-		fieldName := schema.PrimaryKey.FieldName
+		fieldName := schema.PrimaryKey.Name
 		field := v.FieldByName(fieldName)
 		if field.IsValid() && field.CanSet() {
 			field.SetInt(pk)
 		}
 	} else {
-		// No primary key field found in schema, fallback to ID
+		// No primary key field found in models, fallback to ID
 		m.ID = pk
 	}
 }
@@ -99,7 +70,7 @@ func (m *Model) IsNew() bool {
 	return m.isNew
 }
 
-func InitTracking(entity Entity) {
+func InitTracking(entity models.Entity) {
 	if model := getModelFromEntity(entity); model != nil {
 		model.mu.Lock()
 		defer model.mu.Unlock()
@@ -109,7 +80,7 @@ func InitTracking(entity Entity) {
 }
 
 // GetChanges returns changes for the given entity
-func GetChanges(entity Entity) map[string]any {
+func GetChanges(entity models.Entity) map[string]any {
 	if model := getModelFromEntity(entity); model != nil {
 		model.mu.RLock()
 		defer model.mu.RUnlock()
@@ -125,7 +96,7 @@ func GetChanges(entity Entity) map[string]any {
 }
 
 // getModelFromEntity extracts the embedded Model from an entity
-func getModelFromEntity(entity Entity) *Model {
+func getModelFromEntity(entity models.Entity) *Model {
 	entityValue := reflect.ValueOf(entity)
 	if entityValue.Kind() == reflect.Ptr {
 		entityValue = entityValue.Elem()
@@ -143,22 +114,8 @@ func getModelFromEntity(entity Entity) *Model {
 	return nil
 }
 
-// getEmbeddingEntity finds the struct that embeds this Model
-func getEmbeddingEntity(m *Model) Entity {
-	// Use runtime stack inspection to find the calling context
-	// or traverse up the memory structure to find the embedding struct
-
-	// For now, we'll use a more direct approach by checking if the Model
-	// is part of a larger struct by examining memory layout
-	modelPtr := unsafe.Pointer(m)
-
-	// Try to find the embedding entity by checking common patterns
-	// This is a simplified approach - in practice you might need more sophisticated logic
-	return findEmbeddingEntityByReflection(modelPtr)
-}
-
 // captureEntityValues captures all field values from an entity
-func captureEntityValues(entity Entity) map[string]any {
+func captureEntityValues(entity models.Entity) map[string]any {
 	values := make(map[string]any)
 
 	entityValue := reflect.ValueOf(entity)
@@ -206,7 +163,7 @@ func captureEntityValues(entity Entity) map[string]any {
 }
 
 // detectEntityChanges compares current entity values with original values
-func detectEntityChanges(entity Entity, original map[string]any) map[string]any {
+func detectEntityChanges(entity models.Entity, original map[string]any) map[string]any {
 	changes := make(map[string]any)
 
 	entityValue := reflect.ValueOf(entity)
@@ -266,13 +223,55 @@ func detectEntityChanges(entity Entity, original map[string]any) map[string]any 
 	return changes
 }
 
-// findEmbeddingEntityByReflection attempts to find the embedding entity
-func findEmbeddingEntityByReflection(modelPtr unsafe.Pointer) Entity {
-	// This is a simplified implementation
-	// In practice, you might need more sophisticated logic to traverse
-	// the memory layout and find the embedding struct
+func getEntityFields(entityValue reflect.Value, entityType reflect.Type) []reflect.StructField {
+	var fields []reflect.StructField
 
-	// For now, return nil to indicate we couldn't find the embedding entity
-	// The caller should handle this case
-	return nil
+	for i := 0; i < entityType.NumField(); i++ {
+		field := entityType.Field(i)
+
+		// Check if field is embedded (anonymous)
+		if field.Anonymous {
+			// Get the embedded struct type
+			embeddedType := field.Type
+			if embeddedType.Kind() == reflect.Ptr {
+				embeddedType = embeddedType.Elem()
+			}
+
+			// Recursively get fields from embedded struct
+			embeddedFields := getEntityFields(reflect.Value{}, embeddedType)
+			fields = append(fields, embeddedFields...)
+		} else {
+			fields = append(fields, field)
+		}
+	}
+
+	return fields
+}
+
+func getFieldValue(entityValue reflect.Value, fieldName string) (reflect.Value, bool) {
+	entityType := entityValue.Type()
+
+	for i := 0; i < entityType.NumField(); i++ {
+		field := entityType.Field(i)
+		fieldValue := entityValue.Field(i)
+
+		if field.Name == fieldName {
+			return fieldValue, true
+		}
+
+		// Check embedded structs
+		if field.Anonymous {
+			if field.Type.Kind() == reflect.Ptr && !fieldValue.IsNil() {
+				fieldValue = fieldValue.Elem()
+			}
+
+			if fieldValue.IsValid() && fieldValue.Kind() == reflect.Struct {
+				if embeddedValue, found := getFieldValue(fieldValue, fieldName); found {
+					return embeddedValue, true
+				}
+			}
+		}
+	}
+
+	return reflect.Value{}, false
 }
