@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aekis/goql/pkg/models"
+	"github.com/aekis-dev/goql/pkg/models"
 )
 
 // LambdaWrite builds an UPDATE query from a parsed lambda body

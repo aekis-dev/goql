@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/aekis/goql/pkg/models"
+	"github.com/aekis-dev/goql/pkg/models"
 )
 
 var (

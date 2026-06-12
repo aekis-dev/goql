@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/aekis/goql/pkg/models"
+	"github.com/aekis-dev/goql/pkg/models"
 )
 
 // EntityDelete builds a DELETE query for a single entity by PK

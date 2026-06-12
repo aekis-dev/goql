@@ -3,8 +3,8 @@ package tests
 import (
 	"testing"
 
-	"github.com/aekis/goql/pkg/models"
-	"github.com/aekis/goql/pkg/query"
+	"github.com/aekis-dev/goql/pkg/models"
+	"github.com/aekis-dev/goql/pkg/query"
 )
 
 func TestCreateTable_Customer(t *testing.T) {

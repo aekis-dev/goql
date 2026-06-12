@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aekis/goql/pkg/models"
+	"github.com/aekis-dev/goql/pkg/models"
 )
 
 // Model is the base struct for all ORM entities

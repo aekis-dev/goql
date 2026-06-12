@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/aekis/goql/pkg/models"
+	"github.com/aekis-dev/goql/pkg/models"
 )
 
 // CreateTable builds a CREATE TABLE IF NOT EXISTS statement

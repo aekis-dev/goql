@@ -5,8 +5,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/aekis/goql/pkg/orm"
-	"github.com/aekis/goql/pkg/tests/models"
+	"github.com/aekis-dev/goql/pkg/orm"
+	"github.com/aekis-dev/goql/pkg/tests/models"
 	_ "github.com/mattn/go-sqlite3"
 )
 

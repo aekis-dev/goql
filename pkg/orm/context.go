@@ -7,8 +7,8 @@ import (
 	"log"
 	"reflect"
 
-	"github.com/aekis/goql/pkg/models"
-	"github.com/aekis/goql/pkg/query"
+	"github.com/aekis-dev/goql/pkg/models"
+	"github.com/aekis-dev/goql/pkg/query"
 )
 
 var entityType = reflect.TypeOf((*models.Entity)(nil)).Elem()

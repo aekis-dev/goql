@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/aekis/goql/pkg/models"
+	"github.com/aekis-dev/goql/pkg/models"
 )
 
 // WhereClause recursively builds a SQL WHERE clause from a ConditionNode tree

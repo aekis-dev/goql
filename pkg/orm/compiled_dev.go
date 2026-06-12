@@ -2,8 +2,8 @@
 
 package orm
 
-import "github.com/aekis/goql/pkg/query"
-import "github.com/aekis/goql/pkg/models"
+import "github.com/aekis-dev/goql/pkg/query"
+import "github.com/aekis-dev/goql/pkg/models"
 
 // In dev mode the registry is unused — DebugExecutor parses lambdas at runtime
 func RegisterBody(key string, body *query.ParseBody) {} // dev stub

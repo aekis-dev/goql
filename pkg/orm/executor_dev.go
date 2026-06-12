@@ -12,8 +12,8 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/aekis/goql/pkg/models"
-	"github.com/aekis/goql/pkg/query"
+	"github.com/aekis-dev/goql/pkg/models"
+	"github.com/aekis-dev/goql/pkg/query"
 )
 
 // getExecutor returns the appropriate executor based on build tags

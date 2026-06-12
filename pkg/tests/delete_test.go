@@ -3,9 +3,9 @@ package tests
 import (
 	"testing"
 
-	"github.com/aekis/goql/pkg/models"
-	"github.com/aekis/goql/pkg/orm"
-	"github.com/aekis/goql/pkg/query"
+	"github.com/aekis-dev/goql/pkg/models"
+	"github.com/aekis-dev/goql/pkg/orm"
+	"github.com/aekis-dev/goql/pkg/query"
 )
 
 func TestDeleteSQL_Entity(t *testing.T) {

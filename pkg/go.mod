@@ -1,4 +1,4 @@
-module github.com/aekis/goql/pkg
+module github.com/aekis-dev/goql/pkg
 
 go 1.24
 

@@ -1,8 +1,8 @@
 package models
 
 import (
-	"github.com/aekis/goql/pkg/models"
-	"github.com/aekis/goql/pkg/orm"
+	"github.com/aekis-dev/goql/pkg/models"
+	"github.com/aekis-dev/goql/pkg/orm"
 )
 
 type Tag struct {

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/aekis/goql/src/orm"
+	"github.com/aekis-dev/goql/src/orm"
 )
 
 func indent(n int) string {
