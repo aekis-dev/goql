@@ -10,15 +10,15 @@ import (
 
 // Model is the base struct for all ORM entities
 type Model struct {
-	ID        int64
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	DeletedAt *time.Time
+	ID      int64      `json:"id" yaml:"id"`
+	Created time.Time  `json:"goql_created,omitempty" yaml:"goql_created,omitempty"`
+	Updated time.Time  `json:"goql_updated,omitempty" yaml:"goql_updated,omitempty"`
+	Deleted *time.Time `json:"goql_deleted,omitempty" yaml:"goql_deleted,omitempty"`
 	// Change tracking fields (not persisted)
-	mu       sync.RWMutex   `goql:"-" json:"-"`
-	original map[string]any `goql:"-" json:"-"`
-	changes  map[string]any `goql:"-" json:"-"`
-	isNew    bool           `goql:"-" json:"-"`
+	mu       sync.RWMutex   `goql:"-" json:"-" yaml:"-"`
+	original map[string]any `goql:"-" json:"-" yaml:"-"`
+	changes  map[string]any `goql:"-" json:"-" yaml:"-"`
+	isNew    bool           `goql:"-" json:"-" yaml:"-"`
 }
 
 // PrimaryKey returns the default primary key

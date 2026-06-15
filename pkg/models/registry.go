@@ -20,9 +20,9 @@ func init() {
 			NotNull:       true,
 			GoType:        reflect.TypeOf(int64(0)),
 		},
-		"CreatedAt": {
-			Name:           "CreatedAt",
-			Column:         "created_at",
+		"Created": {
+			Name:           "Created",
+			Column:         "goql_created",
 			Type:           "timestamp",
 			Precision:      6,
 			AutoCreateTime: true,
@@ -30,9 +30,9 @@ func init() {
 			GoType:         reflect.TypeOf(time.Time{}),
 			Default:        "CURRENT_TIMESTAMP",
 		},
-		"UpdatedAt": {
-			Name:           "UpdatedAt",
-			Column:         "updated_at",
+		"Updated": {
+			Name:           "Updated",
+			Column:         "goql_updated",
 			Type:           "timestamp",
 			Precision:      6,
 			AutoUpdateTime: true,
@@ -40,12 +40,11 @@ func init() {
 			GoType:         reflect.TypeOf(time.Time{}),
 			Default:        "CURRENT_TIMESTAMP",
 		},
-		"DeletedAt": {
-			Name:      "DeletedAt",
-			Column:    "deleted_at",
+		"Deleted": {
+			Name:      "Deleted",
+			Column:    "goql_deleted",
 			Type:      "timestamp",
 			Precision: 6,
-			Index:     "idx_deleted_at",
 			GoType:    reflect.TypeOf((*time.Time)(nil)),
 		},
 	}
