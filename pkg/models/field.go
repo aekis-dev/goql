@@ -3,6 +3,7 @@ package models
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 )
 
 var entityType = reflect.TypeOf((*Entity)(nil)).Elem()
@@ -104,9 +105,9 @@ func (fs *Field) TargetModel() reflect.Type {
 // GetColumnName returns the database column name for scalar fields
 func (fs *Field) GetColumnName() string {
 	if fs.Column != "" {
-		return fs.Column
+		return strconv.Quote(fs.Column)
 	}
-	return toSnakeCase(fs.Name)
+	return strconv.Quote(toSnakeCase(fs.Name))
 }
 
 // GetDBType returns the database type for scalar fields
