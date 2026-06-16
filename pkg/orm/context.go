@@ -67,9 +67,7 @@ func (ctx *GoqlContext) Search(args ...any) ([]any, error) {
 	// Normalize to []models.Entity for entity-based search
 	var entities []models.Entity
 
-	if entity, ok := arg.(models.Entity); ok {
-		entities = []models.Entity{entity}
-	} else if argValue.Kind() == reflect.Slice {
+	if argValue.Kind() == reflect.Slice {
 		for i := 0; i < argValue.Len(); i++ {
 			elem := argValue.Index(i)
 			var entity models.Entity
@@ -84,6 +82,19 @@ func (ctx *GoqlContext) Search(args ...any) ([]any, error) {
 			if !ok {
 				return nil, fmt.Errorf("slice element %d is not an Entity", i)
 			}
+			entities = append(entities, entity)
+		}
+	} else {
+		var entity models.Entity
+		var ok bool
+		if argValue.Kind() == reflect.Ptr {
+			entity, ok = argValue.Interface().(models.Entity)
+		} else {
+			ptrArg := reflect.New(argType)
+			ptrArg.Elem().Set(argValue)
+			entity, ok = ptrArg.Interface().(models.Entity)
+		}
+		if ok {
 			entities = append(entities, entity)
 		}
 	}
