@@ -1,6 +1,7 @@
 package query
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -47,6 +48,15 @@ func EntityCreate(entity models.Entity, schema *models.Model) (*Query, error) {
 				continue
 			}
 			if isZeroValue(fv) && !fieldSchema.NotNull {
+				continue
+			}
+			if strings.ToLower(fieldSchema.Type) == "jsonb" {
+				jfv, err := json.Marshal(fv.Interface())
+				if err != nil {
+					return nil, err
+				}
+				fields = append(fields, fieldSchema.GetColumnName())
+				values = append(values, jfv)
 				continue
 			}
 			fields = append(fields, fieldSchema.GetColumnName())

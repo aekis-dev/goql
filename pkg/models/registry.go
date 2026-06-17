@@ -80,7 +80,7 @@ func AddModel(model Entity, table string, fields ...*Field) error {
 		f := *baseField
 		f.TableSchema = schema
 		schema.Fields[name] = &f
-		schema.FieldsByDB[f.GetColumnName()] = &f
+		schema.FieldsByDB[f.ColumnName()] = &f
 		if f.PrimaryKey {
 			schema.PrimaryKey = &f
 		}
@@ -115,7 +115,7 @@ func AddModel(model Entity, table string, fields ...*Field) error {
 		case O2M, M2M:
 			// nothing on this table
 		default:
-			schema.FieldsByDB[fieldSchema.GetColumnName()] = fieldSchema
+			schema.FieldsByDB[fieldSchema.ColumnName()] = fieldSchema
 		}
 
 		if fieldSchema.PrimaryKey {

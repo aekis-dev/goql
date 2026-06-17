@@ -1,6 +1,7 @@
 package query
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -23,7 +24,15 @@ func LambdaWrite(body *ParseBody, schema *models.Model) (*Query, error) {
 			setClauses = append(setClauses, fmt.Sprintf("%s = %s", col, assignment.Value.Field.FullColumn()))
 		} else {
 			setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
-			args = append(args, assignment.Value.Value)
+			if strings.ToLower(assignment.Field.Field.Type) == "jsonb" && assignment.Value.Value != nil {
+				jfv, err := json.Marshal(assignment.Value.Value)
+				if err != nil {
+					return nil, fmt.Errorf("field %s: %w", assignment.Field.Field.Name, err)
+				}
+				args = append(args, jfv)
+			} else {
+				args = append(args, assignment.Value.Value)
+			}
 		}
 	}
 
@@ -96,7 +105,15 @@ func EntityWrite(entity models.Entity, schema *models.Model, changes map[string]
 			args = append(args, newValue)
 		default:
 			setClauses = append(setClauses, fmt.Sprintf("%s = ?", field.GetColumnName()))
-			args = append(args, newValue)
+			if strings.ToLower(field.Type) == "jsonb" && newValue != nil {
+				jfv, err := json.Marshal(newValue)
+				if err != nil {
+					return nil, fmt.Errorf("field %s: %w", fieldName, err)
+				}
+				args = append(args, jfv)
+			} else {
+				args = append(args, newValue)
+			}
 		}
 	}
 

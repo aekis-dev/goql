@@ -102,12 +102,18 @@ func (fs *Field) TargetModel() reflect.Type {
 	return t
 }
 
-// GetColumnName returns the database column name for scalar fields
-func (fs *Field) GetColumnName() string {
+// ColumnName returns the unquoted database column name for scalar fields.
+// Use this for map keys and matching against driver-reported column names.
+func (fs *Field) ColumnName() string {
 	if fs.Column != "" {
-		return strconv.Quote(fs.Column)
+		return fs.Column
 	}
-	return strconv.Quote(toSnakeCase(fs.Name))
+	return toSnakeCase(fs.Name)
+}
+
+// GetColumnName returns the quoted database column name for SQL emission.
+func (fs *Field) GetColumnName() string {
+	return strconv.Quote(fs.ColumnName())
 }
 
 // GetDBType returns the database type for scalar fields

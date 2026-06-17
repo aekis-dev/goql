@@ -2,6 +2,7 @@ package orm
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"reflect"
@@ -173,6 +174,12 @@ func mapColumnsToEntity(entity any, columns []string, values []interface{}) erro
 		if field, exists := schema.FieldsByDB[column]; exists {
 			fieldValue := entityValue.FieldByName(field.Name)
 			if fieldValue.IsValid() && fieldValue.CanSet() {
+				if strings.ToLower(field.Type) == "jsonb" {
+					if err := unmarshalJSONField(fieldValue, values[i]); err != nil {
+						return err
+					}
+					continue
+				}
 				if err := setFieldValue(fieldValue, values[i]); err != nil {
 					return err
 				}
@@ -181,6 +188,25 @@ func mapColumnsToEntity(entity any, columns []string, values []interface{}) erro
 	}
 
 	return nil
+}
+
+// unmarshalJSONField decodes a jsonb column value into a struct/map/slice field.
+func unmarshalJSONField(field reflect.Value, value interface{}) error {
+	var data []byte
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case []byte:
+		data = v
+	case string:
+		data = []byte(v)
+	default:
+		return fmt.Errorf("unsupported jsonb source type %T", value)
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	return json.Unmarshal(data, field.Addr().Interface())
 }
 
 // setFieldValue sets a reflect.Value from a database value
