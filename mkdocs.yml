@@ -1,0 +1,74 @@
+site_name: goql
+site_description: An ORM for Go where queries are written as ordinary Go functions.
+site_url: https://goql.readthedocs.io/
+repo_url: https://github.com/aekis-dev/goql
+repo_name: aekis-dev/goql
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Core concepts:
+      - Lambdas are parsed, not executed: lambdas.md
+      - Declaring models: models.md
+      - Runtime values (params): params.md
+  - Writing queries:
+      - Struct calls (by example): struct-calls.md
+      - Predicates and conditions: predicates.md
+      - Query options: options.md
+      - Relations and preloading: relations.md
+      - Joins: joins.md
+      - Expressions: expressions.md
+      - Aggregates and projections: aggregates.md
+      - Grouping and HAVING: grouping.md
+      - Subqueries: subqueries.md
+      - Set operations: set-operations.md
+      - Common table expressions: cte.md
+      - Recursive queries: recursive.md
+      - INSERT … SELECT: insert-select.md
+      - Raw SQL: raw-sql.md
+  - Operations:
+      - Transactions: transactions.md
+      - Dialects and portability: dialects.md
+      - Migrations: migrations.md
+      - Production builds: production.md
+  - Reference:
+      - Errors: errors.md
+      - Limitations: limitations.md

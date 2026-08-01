@@ -1740,3 +1740,50 @@ the walk stops where the predicate says.
 refused, ordering in the recursive term refused, no fallback without CTEs, an end-to-end walk
 of a three-level hierarchy, and the depth bound. The demo walks a category tree, and the
 generated registry was verified to contain `Recursive: true`.
+
+---
+
+## 22. Documentation, and three bugs it found (2026-08-01)
+
+**248 tests passing, dev and prod clean, dev/prod demo output byte-identical.**
+
+A Read the Docs site (`docs/`, MkDocs + Material, `.readthedocs.yaml`) — 25 pages covering the
+lambda contract, models, every query shape, dialects, migrations and production builds. Built
+with `mkdocs build --strict`, so a broken internal link fails.
+
+**Writing the docs was a review pass**, and it surfaced three defects that the test suite did
+not. Each is fixed, with a regression test.
+
+### A projection's ORDER BY named the model, not the projection
+`sort.By = "Total"` on an aggregate query emitted `ORDER BY o."total_amount"` — the model's
+column — rather than the projected `"Total"`. SQLite tolerates it; **Postgres rejects the
+statement outright**, since that column is neither grouped nor aggregated. The set-operation
+path already resolved sorts against projected columns, so the fix generalises that into
+`projectionTail` and uses it for any query that names its own columns. Naming a column the
+projection does not select is now an error rather than a wrong ORDER BY.
+
+### A params struct could not reach a CTE branch
+`parseSubBody` inherits `paramsName`/`paramsType` from the enclosing context;
+`parseProjectionSource` did not. So a params value was unusable inside a CTE's defining
+lambda — the natural way to seed a recursive walk from a runtime id. One-line inconsistency,
+now fixed, with an end-to-end test walking a subtree from a params-supplied node.
+
+### Tuple assignments were silently dropped
+`r.ID, r.Name, r.Depth = c.ID, c.Name, 0` is ordinary Go and reads well in a projection — and
+matched **nothing**. Every handler (`tryParseOptionAssignment`, `tryParseSubqueryDecl`,
+`tryParseProjection`, `tryParseAssignment`) checks `len(s.Lhs) != 1` and skips, so a tuple
+assignment fell through all four and vanished. Where every column used one it surfaced as
+"the projection selects nothing"; mixed with single assignments it would have **silently
+omitted columns**.
+- **Decision**: expand `a, b = x, y` into one statement per target before dispatch
+  (`expandAssignments`), applied at every statement-list walk. A declaration binding two names
+  from one call (`x, _ := goql.Select(…)`) has a single right-hand side and is left alone.
+- **Rationale**: it is the same silent-ignore class as the dropped `Preload`, the swallowed
+  `from.Model` and the missing prod `Options` — fixed at the dispatch point rather than in
+  each of the four handlers.
+
+### Documented examples are tested
+`tests/docs_test.go` exercises the examples that were written from memory rather than lifted
+from a passing test — `Condition` forms, composed sorts, a subquery projecting a named column,
+joining a CTE, inserting a model into itself, and `Conflict{Ignore}`. A change that invalidates
+the documentation now fails the suite.

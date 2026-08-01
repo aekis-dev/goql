@@ -130,7 +130,13 @@ func (d *Dialect) lambdaSearchIn(q *ParseQuery, opts *Options, s *stmt) (*Query,
 	}
 
 	// Rendered last so its placeholders follow the WHERE clause's.
+	//
+	// A projection names its own columns: ordering by a model field would emit a column that
+	// is neither grouped nor aggregated, which SQLite tolerates and Postgres rejects.
 	tail, tailArgs, err := d.optionsTail(opts, schema, alias, s)
+	if body.Projection() {
+		tail, tailArgs, err = d.projectionTail(body.Select, opts, s)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -181,6 +187,14 @@ func (d *Dialect) lambdaSetSearchIn(q *ParseQuery, opts *Options, s *stmt) (*Que
 // setOptionsTail renders ORDER BY / LIMIT / OFFSET for a set operation, checking that a sort
 // names a column the branches actually produce.
 func (d *Dialect) setOptionsTail(set *ParseSet, opts *Options, s *stmt) (string, []any, error) {
+	return d.projectionTail(set.Branches[0].Body.Select, opts, s)
+}
+
+// projectionTail renders ORDER BY / LIMIT / OFFSET for a query that names its own columns —
+// a projection, or a set operation over projections. A sort names a projected column, since
+// there is no model field to resolve against: an aggregate has no column of its own, and a
+// grouped query cannot order by an ungrouped one.
+func (d *Dialect) projectionTail(selects []*ParseSelect, opts *Options, s *stmt) (string, []any, error) {
 	if opts == nil {
 		return "", nil, nil
 	}
@@ -190,7 +204,7 @@ func (d *Dialect) setOptionsTail(set *ParseSet, opts *Options, s *stmt) (string,
 
 	if len(opts.Sorts) > 0 {
 		produced := map[string]bool{}
-		for _, sel := range set.Branches[0].Body.Select {
+		for _, sel := range selects {
 			produced[sel.Into] = true
 		}
 
@@ -198,7 +212,7 @@ func (d *Dialect) setOptionsTail(set *ParseSet, opts *Options, s *stmt) (string,
 		for _, sort := range opts.Sorts {
 			if !produced[sort.By] {
 				return "", nil, fmt.Errorf(
-					"cannot order a %s by %s: the branches do not select it", set.Op, sort.By)
+					"cannot order by %s: the query does not select it", sort.By)
 			}
 			term := d.QuoteIdent(sort.By)
 			if sort.Desc {

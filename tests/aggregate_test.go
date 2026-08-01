@@ -382,3 +382,57 @@ func TestGroup_RequiresAnAggregate(t *testing.T) {
 		t.Fatalf("expected grouping without aggregation to be reported, got %v", err)
 	}
 }
+
+// A projection names its own columns, so an ORDER BY resolves against them. Resolving it
+// against the model instead emitted a column that is neither grouped nor aggregated —
+// tolerated by SQLite, rejected outright by Postgres.
+func TestAggregate_SortsByProjectedColumn(t *testing.T) {
+	body := parseSource(t, `func(t *PriorityTotals, o *Order, from *goql.From, sort *goql.Sort) bool {
+		from.Model = o
+		t.Priority = o.Priority
+		t.Total = goql.Sum(o.Total)
+		sort.By = "Total"
+		sort.Desc = true
+		return o.Total > 0
+	}`)
+
+	q, err := sqlite.LambdaSearch(body, body.Body.Options)
+	assertNoError(t, err)
+	assertContains(t, q.SQL, `ORDER BY "Total" DESC`)
+	if strings.Contains(q.SQL, `ORDER BY o."total_amount"`) {
+		t.Fatalf("ordering must name the projected column, not the model field:\n%s", q.SQL)
+	}
+}
+
+// Ordering by something the projection does not select is refused rather than emitted.
+func TestAggregate_RejectsSortOnUnprojectedColumn(t *testing.T) {
+	body := parseSource(t, `func(t *PriorityTotals, o *Order, from *goql.From, sort *goql.Sort) bool {
+		from.Model = o
+		t.Priority = o.Priority
+		t.Total = goql.Sum(o.Total)
+		sort.By = "Largest"
+		return o.Total > 0
+	}`)
+
+	if _, err := sqlite.LambdaSearch(body, body.Body.Options); err == nil ||
+		!strings.Contains(err.Error(), "does not select it") {
+		t.Fatalf("expected an unprojected sort column to be refused, got: %v", err)
+	}
+}
+
+// A tuple assignment is ordinary Go and means one statement per target. Every handler
+// matches a single left-hand side, so without expansion it matched none of them and the
+// columns were silently dropped.
+func TestAggregate_TupleAssignmentProjectsEveryColumn(t *testing.T) {
+	body := parseSource(t, `func(t *PriorityTotals, o *Order, from *goql.From) bool {
+		from.Model = o
+		t.Priority, t.Total = o.Priority, goql.Sum(o.Total)
+		return o.Total > 0
+	}`)
+
+	q, err := sqlite.LambdaSearch(body, nil)
+	assertNoError(t, err)
+	assertContains(t, q.SQL, `o."priority" AS "Priority"`)
+	assertContains(t, q.SQL, `SUM(o."total_amount") AS "Total"`)
+	assertContains(t, q.SQL, `GROUP BY o."priority"`)
+}

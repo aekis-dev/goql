@@ -246,7 +246,7 @@ func TestUnion_RejectsSortOnAColumnNoBranchSelects(t *testing.T) {
 		})
 		return goql.Union(a, b)
 	})
-	if err == nil || !strings.Contains(err.Error(), "do not select it") {
+	if err == nil || !strings.Contains(err.Error(), "does not select it") {
 		t.Fatalf("expected an unknown sort column to be refused, got %v", err)
 	}
 }

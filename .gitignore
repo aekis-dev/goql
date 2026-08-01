@@ -13,3 +13,4 @@ goql_registry_prod.go
 .DS_Store
 .idea/
 .vscode/
+site/

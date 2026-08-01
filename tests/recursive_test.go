@@ -292,3 +292,62 @@ func TestRecursive_DepthBoundsTheWalk(t *testing.T) {
 		t.Fatalf("expected the walk bounded to depth 2 with 3 nodes, got %+v", rows[0])
 	}
 }
+
+// RootID is a params struct used to seed a walk from a runtime value.
+type RootID struct{ Value int64 }
+
+// Params are declared once on the outermost lambda and are in scope for every nested body,
+// including a CTE branch — the model-typed subquery path already inherited them, and a
+// projection was inconsistent with it.
+func TestRecursive_ParamsReachTheAnchor(t *testing.T) {
+	ctx, e, cleanup := setupDB(t)
+	defer cleanup()
+
+	if err := e.CreateTables(&Category{}); err != nil {
+		t.Fatal(err)
+	}
+	root, err := goql.Create(ctx, e, []Category{{Name: "root"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mid, err := goql.Create(ctx, e, []Category{{Name: "mid", Parent: root[0]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := goql.Create(ctx, e, []Category{{Name: "leaf", Parent: mid[0]}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Walk from "mid" rather than from the roots: it and its one child.
+	rows, err := goql.Select[TreeSummary](ctx, e,
+		func(s *TreeSummary, n *CatNode, from *goql.From, p RootID) bool {
+			sub, _ := goql.Select[CatNode](ctx, e, func(t []*CatNode) bool {
+				seed, _ := goql.Select[CatNode](ctx, e,
+					func(r *CatNode, c *Category, f *goql.From) bool {
+						f.Model = c
+						r.ID, r.Name, r.Depth = c.ID, c.Name, 0
+						return c.ID == p.Value
+					})
+				kids, _ := goql.Select[CatNode](ctx, e,
+					func(r *CatNode, prev *CatNode, c *Category, f *goql.From, j *goql.Join) bool {
+						f.Model = c
+						j.Query, j.Model = t, prev
+						j.On = c.Parent.ID == prev.ID
+						r.ID, r.Name = c.ID, c.Name
+						r.Depth = prev.Depth + 1
+						return prev.Depth < 10
+					})
+				return goql.UnionAll(seed, kids)
+			})
+			from.Query, from.Model = sub, n
+			s.Nodes = goql.Count()
+			s.Deepest = goql.Max(n.Depth)
+			return true
+		}, RootID{Value: mid[0].ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].Nodes != 2 || rows[0].Deepest != 1 {
+		t.Fatalf("expected mid and its child, got %+v", rows[0])
+	}
+}

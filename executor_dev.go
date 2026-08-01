@@ -846,7 +846,7 @@ func (e *DebugExecutor) parseBody(funcLit *ast.FuncLit, pctx *parseContext) (*qu
 	// "everything".
 	var bodyPriors []*query.ParseNode
 
-	for _, stmt := range funcLit.Body.List {
+	for _, stmt := range expandAssignments(funcLit.Body.List) {
 		switch s := stmt.(type) {
 
 		case *ast.AssignStmt:
@@ -1273,7 +1273,7 @@ func (e *DebugExecutor) parseRangeStmt(rangeStmt *ast.RangeStmt, pctx *parseCont
 
 	innerCtx := newParseContext(targetSchema, iterVar)
 
-	for _, stmt := range rangeStmt.Body.List {
+	for _, stmt := range expandAssignments(rangeStmt.Body.List) {
 		ifStmt, ok := stmt.(*ast.IfStmt)
 		if !ok {
 			continue
@@ -1306,7 +1306,7 @@ func (e *DebugExecutor) parseRangeStmt(rangeStmt *ast.RangeStmt, pctx *parseCont
 
 // findSentinelAssignment finds "varName = true" inside a block, returns varName
 func (e *DebugExecutor) findSentinelAssignment(block *ast.BlockStmt) string {
-	for _, stmt := range block.List {
+	for _, stmt := range expandAssignments(block.List) {
 		assignStmt, ok := stmt.(*ast.AssignStmt)
 		if !ok {
 			continue
@@ -1651,7 +1651,7 @@ func (e *DebugExecutor) extractRelatedPKs(expr ast.Expr) ([]any, error) {
 
 // returnsTrue checks if a block statement returns true
 func (e *DebugExecutor) returnsTrue(block *ast.BlockStmt) bool {
-	for _, stmt := range block.List {
+	for _, stmt := range expandAssignments(block.List) {
 		if retStmt, ok := stmt.(*ast.ReturnStmt); ok {
 			if len(retStmt.Results) == 1 {
 				return e.isAlwaysTrue(retStmt.Results[0])
@@ -2228,4 +2228,42 @@ func sliceOfPointers(expr ast.Expr) bool {
 	}
 	_, isPointer := array.Elt.(*ast.StarExpr)
 	return isPointer
+}
+
+// expandAssignments rewrites `a.X, a.Y = b.X, b.Y` into one statement per target.
+//
+// It is ordinary Go and means exactly that, but every handler matches a single left-hand
+// side — so without this a tuple assignment matched none of them and was silently dropped,
+// which is the failure mode this project keeps removing. A declaration binding two names
+// from one call (`x, _ := goql.Select(…)`) has a single right-hand side and is left alone.
+func expandAssignments(stmts []ast.Stmt) []ast.Stmt {
+	needsSplit := false
+	for _, stmt := range stmts {
+		if assign, ok := stmt.(*ast.AssignStmt); ok &&
+			len(assign.Lhs) > 1 && len(assign.Lhs) == len(assign.Rhs) {
+			needsSplit = true
+			break
+		}
+	}
+	if !needsSplit {
+		return stmts
+	}
+
+	out := make([]ast.Stmt, 0, len(stmts)+2)
+	for _, stmt := range stmts {
+		assign, ok := stmt.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) < 2 || len(assign.Lhs) != len(assign.Rhs) {
+			out = append(out, stmt)
+			continue
+		}
+		for i := range assign.Lhs {
+			out = append(out, &ast.AssignStmt{
+				Lhs:    []ast.Expr{assign.Lhs[i]},
+				TokPos: assign.TokPos,
+				Tok:    assign.Tok,
+				Rhs:    []ast.Expr{assign.Rhs[i]},
+			})
+		}
+	}
+	return out
 }

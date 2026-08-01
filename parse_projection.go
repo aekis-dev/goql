@@ -304,6 +304,13 @@ func (e *DebugExecutor) parseProjectionSource(funcLit *ast.FuncLit, params []lam
 	// is evaluated before the outer query has a row. Their names are remembered only so
 	// referencing one is reported for what it is.
 	pctx.outerNames = outerParamNames(outer)
+	if outer != nil {
+		// A params struct is declared once, on the outermost lambda, and is in scope for
+		// every nested body — the model-typed subquery path already inherits it, and a
+		// projection is no different.
+		pctx.paramsName = outer.paramsName
+		pctx.paramsType = outer.paramsType
+	}
 	if outer != nil && pctx.selfHandle == "" {
 		// A branch of a recursive CTE may join the CTE being defined, whose handle is
 		// declared by the combining lambda around it — inherited only when this lambda is
