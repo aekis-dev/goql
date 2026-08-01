@@ -24,11 +24,21 @@ func (d *Dialect) LambdaSearch(q *ParseQuery, opts *Options) (*Query, error) {
 // lambdaSearchIn builds a SELECT within an existing statement, so a set operation can render
 // its branches into one placeholder sequence.
 func (d *Dialect) lambdaSearchIn(q *ParseQuery, opts *Options, s *stmt) (*Query, error) {
-	schema, err := q.Schema()
+	body := q.Body
+
+	// A query may read from a common table expression rather than a table, in which case its
+	// "schema" is that query's projection.
+	schema, err := q.SchemaIn(body.With)
 	if err != nil {
 		return nil, err
 	}
-	body := q.Body
+
+	// Definitions are rendered before the statement that reads them, so their placeholders
+	// come first.
+	with, withArgs, err := d.withClause(body, s)
+	if err != nil {
+		return nil, err
+	}
 
 	// Claim the primary table's alias first so it gets the preferred short form.
 	alias := s.alias.Alias(schema.TableName)
@@ -39,15 +49,39 @@ func (d *Dialect) lambdaSearchIn(q *ParseQuery, opts *Options, s *stmt) (*Query,
 	}
 	// A projection replaces the model's columns entirely: it names what comes back, and
 	// aliases each column so scanning does not depend on order.
+	args := withArgs
 	if body.Projection() {
-		selectList, err = d.projectionList(body, schema, alias, s)
+		var selectArgs []any
+		selectList, selectArgs, err = d.projectionList(body, schema, alias, s)
 		if err != nil {
 			return nil, err
 		}
+		// A computed column can bind a value, and the SELECT list is emitted first.
+		args = append(args, selectArgs...)
 	}
 
-	sql := fmt.Sprintf("SELECT %s FROM %s", selectList, s.fromList(body, schema))
-	var args []any
+	from := s.fromList(body, schema)
+	if q.From != "" && !d.SupportsCTE() {
+		// No WITH on this engine: the definition is inlined where it is read.
+		derived, derivedArgs, err := d.derivedTable(body, q.From, s)
+		if err != nil {
+			return nil, err
+		}
+		from, args = derived, append(args, derivedArgs...)
+	}
+
+	sql := with + fmt.Sprintf("SELECT %s FROM %s", selectList, from)
+
+	// Explicit joins are rendered before anything derived from the predicate, so their bound
+	// values are appended in the order their placeholders appear.
+	explicit, explicitArgs, err := d.explicitJoins(body.Options, s)
+	if err != nil {
+		return nil, err
+	}
+	if explicit != "" {
+		sql += " " + explicit
+		args = append(args, explicitArgs...)
+	}
 
 	// Every selecting branch contributes; nil means unconditional. A condition over an
 	// aggregate filters groups rather than rows, so it is split out into HAVING.
@@ -72,16 +106,17 @@ func (d *Dialect) lambdaSearchIn(q *ParseQuery, opts *Options, s *stmt) (*Query,
 				return nil, err
 			}
 			sql += " WHERE " + where
-			args = whereArgs
+			args = append(args, whereArgs...)
 		}
 	}
 
 	// Grouping follows the WHERE clause and precedes ordering.
-	groupTerms, err := d.groupTerms(body, schema, alias, s)
+	groupTerms, groupArgs, err := d.groupTerms(body, schema, alias, s)
 	if err != nil {
 		return nil, err
 	}
 	if len(groupTerms) > 0 {
+		args = append(args, groupArgs...)
 		sql += " GROUP BY " + strings.Join(groupTerms, ", ")
 	}
 
@@ -110,8 +145,13 @@ func (d *Dialect) lambdaSearchIn(q *ParseQuery, opts *Options, s *stmt) (*Query,
 // aliased. The placeholder counter is shared, because Postgres numbers parameters across the
 // whole statement.
 func (d *Dialect) lambdaSetSearch(q *ParseQuery, opts *Options) (*Query, error) {
+	return d.lambdaSetSearchIn(q, opts, d.newStmt())
+}
+
+// lambdaSetSearchIn renders a set operation within an existing statement, so one nested in a
+// CTE keeps the enclosing placeholder sequence.
+func (d *Dialect) lambdaSetSearchIn(q *ParseQuery, opts *Options, s *stmt) (*Query, error) {
 	set := q.Body.Set
-	s := d.newStmt()
 
 	parts := make([]string, 0, len(set.Branches))
 	var args []any
@@ -188,14 +228,15 @@ func (d *Dialect) setOptionsTail(set *ParseSet, opts *Options, s *stmt) (string,
 // then every plain projected column that is not already among them. Projecting a column
 // always groups by it, so a projection cannot be invalid on Postgres while quietly returning
 // an arbitrary row's value on SQLite.
-func (d *Dialect) groupTerms(body *ParseBody, schema *models.Model, alias string, s *stmt) ([]string, error) {
+func (d *Dialect) groupTerms(body *ParseBody, schema *models.Model, alias string, s *stmt) ([]string, []any, error) {
 	var terms []string
+	var args []any
 	seen := map[string]bool{}
 
 	for _, name := range body.Options.groupKeys() {
 		col, err := d.columnFor(schema, alias, name)
 		if err != nil {
-			return nil, fmt.Errorf("group by: %w", err)
+			return nil, nil, fmt.Errorf("group by: %w", err)
 		}
 		if !seen[col] {
 			seen[col] = true
@@ -205,23 +246,29 @@ func (d *Dialect) groupTerms(body *ParseBody, schema *models.Model, alias string
 
 	// Explicit keys alone do not group anything unless something is aggregated.
 	if len(terms) > 0 && !body.Aggregated() {
-		return nil, fmt.Errorf("group by names %d key(s) but the query aggregates nothing",
+		return nil, nil, fmt.Errorf("group by names %d key(s) but the query aggregates nothing",
 			len(terms))
 	}
 
 	for _, group := range body.GroupBy() {
-		col := s.column(group.Field)
+		// A projected column may be computed, in which case the group term is the same
+		// expression — SQL groups by the expression, not by an alias.
+		col, groupArgs, err := d.selectExpr(group, "", s)
+		if err != nil {
+			return nil, nil, err
+		}
 		if !seen[col] {
 			seen[col] = true
 			terms = append(terms, col)
+			args = append(args, groupArgs...)
 		}
 	}
-	return terms, nil
+	return terms, args, nil
 }
 
 // projectionList renders an explicit projection, aliasing every column to the result field
 // it lands in.
-func (d *Dialect) projectionList(body *ParseBody, schema *models.Model, alias string, s *stmt) (string, error) {
+func (d *Dialect) projectionList(body *ParseBody, schema *models.Model, alias string, s *stmt) (string, []any, error) {
 	// A join multiplies rows, so counting them would count one entity several times. This is
 	// the same rule the dedicated Count builder applied before projections existed.
 	distinct := ""
@@ -232,14 +279,16 @@ func (d *Dialect) projectionList(body *ParseBody, schema *models.Model, alias st
 	}
 
 	cols := make([]string, 0, len(body.Select))
+	var args []any
 	for _, sel := range body.Select {
-		expr, err := d.selectExpr(sel, distinct, s)
+		expr, exprArgs, err := d.selectExpr(sel, distinct, s)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
+		args = append(args, exprArgs...)
 		cols = append(cols, fmt.Sprintf("%s AS %s", expr, d.QuoteIdent(sel.Into)))
 	}
-	return strings.Join(cols, ", "), nil
+	return strings.Join(cols, ", "), args, nil
 }
 
 // orEmpty guards CollectJoins against a nil condition.
@@ -253,24 +302,35 @@ func orEmpty(node *ParseNode) *ParseNode {
 // selectExpr renders one projected column: the column itself, or an aggregate over it.
 // countDistinct is the expression COUNT(*) becomes when the query joins, so a row matched
 // through several related rows is still counted once.
-func (d *Dialect) selectExpr(sel *ParseSelect, countDistinct string, s *stmt) (string, error) {
+func (d *Dialect) selectExpr(sel *ParseSelect, countDistinct string, s *stmt) (string, []any, error) {
 	if sel.Func == "" {
-		if sel.Field == nil {
-			return "", fmt.Errorf("projected column %s has no field", sel.Into)
+		// A computed column: an expression, or a literal placed straight into the result.
+		if sel.Value != nil {
+			return d.valueSQL(sel.Value, s)
 		}
-		return s.column(sel.Field), nil
+		if sel.Field == nil {
+			return "", nil, fmt.Errorf("projected column %s has no field", sel.Into)
+		}
+		return s.column(sel.Field), nil, nil
 	}
 	if sel.Field == nil {
+		if sel.Value != nil {
+			expr, args, err := d.valueSQL(sel.Value, s)
+			if err != nil {
+				return "", nil, err
+			}
+			return fmt.Sprintf("%s(%s)", strings.ToUpper(sel.Func), expr), args, nil
+		}
 		// COUNT counts rows when given no column.
 		if sel.Func != "Count" {
-			return "", fmt.Errorf("%s needs a column", sel.Func)
+			return "", nil, fmt.Errorf("%s needs a column", sel.Func)
 		}
 		if countDistinct != "" {
-			return fmt.Sprintf("COUNT(%s)", countDistinct), nil
+			return fmt.Sprintf("COUNT(%s)", countDistinct), nil, nil
 		}
-		return "COUNT(*)", nil
+		return "COUNT(*)", nil, nil
 	}
-	return fmt.Sprintf("%s(%s)", strings.ToUpper(sel.Func), s.column(sel.Field)), nil
+	return fmt.Sprintf("%s(%s)", strings.ToUpper(sel.Func), s.column(sel.Field)), nil, nil
 }
 
 // EntitySearch builds a SELECT query from one or more entities.

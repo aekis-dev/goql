@@ -75,6 +75,15 @@ func (e *DebugExecutor) tryParseSubqueryDecl(s *ast.AssignStmt, pctx *parseConte
 	}
 	pctx.subqueries[name] = sub
 
+	// The first branch parsed inside a combining lambda is the anchor of a recursive query,
+	// and its projection is the shape the self-reference presents — which is where SQL takes
+	// a recursive CTE's column types from too.
+	if pctx.selfHandle != "" && len(pctx.selfColumns) == 0 {
+		for _, sel := range sub.Body.Select {
+			pctx.selfColumns = append(pctx.selfColumns, sel.Into)
+		}
+	}
+
 	// Go forces a bound error to be used, and the only honest use is discarding it, so a
 	// named one is remembered to give a clear message if the body tests it.
 	if len(s.Lhs) > 1 {
@@ -143,7 +152,7 @@ func (e *DebugExecutor) parseSubCall(call *ast.CallExpr, pctx *parseContext) (*q
 	typeName := baseTypeName(index.Index)
 	schema := modelByTypeName(typeName)
 	if schema == nil {
-		return e.parseProjectionSource(funcLit, flatParams(funcLit))
+		return e.parseProjectionSource(funcLit, flatParams(funcLit), pctx)
 	}
 
 	body, err := e.parseSubBody(funcLit, schema, pctx)

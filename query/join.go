@@ -48,49 +48,61 @@ func (d *Dialect) leafClause(node *ParseNode, s *stmt) (string, []any, error) {
 	}
 
 	col := node.RawColumn
-	if node.Agg != nil {
+	var args []any
+	switch {
+	case node.Agg != nil:
 		// A condition over an aggregate: SUM(total) > 1000, emitted in HAVING.
-		expr, err := d.selectExpr(node.Agg, "", s)
+		expr, aggArgs, err := d.selectExpr(node.Agg, "", s)
 		if err != nil {
 			return "", nil, err
 		}
-		col = expr
-	} else if col == "" {
+		col, args = expr, aggArgs
+
+	case node.LeftValue != nil:
+		// A computed left-hand side: o.Price * o.Qty > 100.
+		expr, leftArgs, err := d.valueSQL(node.LeftValue, s)
+		if err != nil {
+			return "", nil, err
+		}
+		col, args = expr, leftArgs
+
+	case col == "":
 		col = s.column(node.Left)
 	}
 
 	// Operators that take no right-hand side at all.
 	if IsNullaryOperator(node.Operator) {
-		return fmt.Sprintf("%s %s", col, node.Operator), nil, nil
+		return fmt.Sprintf("%s %s", col, node.Operator), args, nil
 	}
 
 	// A nested query as the right-hand side: IN (SELECT …) or a scalar comparison. Checked
 	// before the list branch, since IN is a list operator but takes no bound values here.
 	if node.Sub != nil {
-		sql, args, err := d.subQuery(node.Sub, s)
+		sql, subArgs, err := d.subQuery(node.Sub, s)
 		if err != nil {
 			return "", nil, err
 		}
-		return fmt.Sprintf("%s %s %s", col, node.Operator, sql), args, nil
+		return fmt.Sprintf("%s %s %s", col, node.Operator, sql), append(args, subArgs...), nil
 	}
 
 	// Operators that take a list.
 	if IsListOperator(node.Operator) {
-		args := make([]any, len(node.Values))
+		values := make([]any, len(node.Values))
 		for i, value := range node.Values {
-			args[i] = value.Value
+			values[i] = value.Value
 		}
-		return fmt.Sprintf("%s %s (%s)", col, node.Operator, s.marks(len(args))), args, nil
+		return fmt.Sprintf("%s %s (%s)", col, node.Operator, s.marks(len(values))), append(args, values...), nil
 	}
 
 	if node.Right == nil {
 		// Defensive: a single-value operator without a value would emit invalid SQL.
-		return fmt.Sprintf("%s %s %s", col, node.Operator, s.mark()), []any{nil}, nil
+		return fmt.Sprintf("%s %s %s", col, node.Operator, s.mark()), append(args, nil), nil
 	}
-	if node.Right.IsColumn {
-		return fmt.Sprintf("%s %s %s", col, node.Operator, s.column(node.Right.Field)), nil, nil
+	right, rightArgs, err := d.valueSQL(node.Right, s)
+	if err != nil {
+		return "", nil, err
 	}
-	return fmt.Sprintf("%s %s %s", col, node.Operator, s.mark()), []any{node.Right.Value}, nil
+	return fmt.Sprintf("%s %s %s", col, node.Operator, right), append(args, rightArgs...), nil
 }
 
 // CollectJoins walks a condition tree and returns all nodes requiring a JOIN
@@ -134,6 +146,37 @@ func (d *Dialect) joinClauses(cond *ParseNode, s *stmt) ([]string, error) {
 		clauses = append(clauses, clause)
 	}
 	return clauses, nil
+}
+
+// explicitJoins renders the joins a lambda declared with a *goql.Join carrier, in
+// declaration order, and returns the values bound by their ON conditions.
+//
+// Unlike a join derived from a relation, the condition is whatever the caller wrote — which
+// is what makes joining unrelated models, and choosing the kind, expressible at all.
+func (d *Dialect) explicitJoins(opts *Options, s *stmt) (string, []any, error) {
+	if opts == nil || len(opts.Joins) == 0 {
+		return "", nil, nil
+	}
+
+	var clauses []string
+	var args []any
+	for _, join := range opts.Joins {
+		kind := join.Type
+		if kind == "" {
+			kind = "INNER"
+		}
+		if !d.SupportsJoinType(kind) {
+			return "", nil, fmt.Errorf("%s does not support %s JOIN", d.Name(), kind)
+		}
+
+		on, onArgs, err := d.whereClause(join.On, s)
+		if err != nil {
+			return "", nil, fmt.Errorf("join on %s: %w", join.Table, err)
+		}
+		clauses = append(clauses, fmt.Sprintf("%s JOIN %s ON %s", kind, s.alias.From(join.Table), on))
+		args = append(args, onArgs...)
+	}
+	return strings.Join(clauses, " "), args, nil
 }
 
 // RelationTargetSchema resolves the schema of a relation field's target model.

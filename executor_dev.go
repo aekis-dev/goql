@@ -78,6 +78,37 @@ type parseContext struct {
 	sortSpecs map[string]*query.SortSpec
 	sortOrder []string
 
+	// One JoinSpec per *Join parameter, likewise in declaration order.
+	joinSpecs map[string]*query.JoinSpec
+	joinOrder []string
+
+	// outerNames are the enclosing lambda's model parameters, for a nested projection that
+	// deliberately does not inherit them.
+	outerNames map[string]bool
+
+	// rowParams are pointer parameters whose type is neither an option carrier nor a
+	// registered model: candidates for standing in as a row of a CTE.
+	rowParams map[string]bool
+
+	// cte is the common table expression this lambda reads from, once from.Query names one.
+	cte *query.ParseCTE
+
+	// cteRows maps a parameter standing for a row of a named query to that query's name and
+	// columns — the one from.Query reads from, and any joined with join.Query.
+	cteRows map[string]*query.ParseCTE
+
+	// selfHandle is the parameter of a combining lambda that stands for the CTE being
+	// defined: `t []*CatNode`, the rows produced so far. Joining it is what makes a
+	// recursive CTE recursive, stated rather than inferred.
+	selfHandle string
+
+	// selfColumns are the columns the self-reference presents, taken from the first branch
+	// parsed — the anchor term, which is where SQL takes a recursive CTE's shape from too.
+	selfColumns []string
+
+	// recursive is set once a branch joins the CTE being defined.
+	recursive bool
+
 	opts *query.Options
 
 	// paramsName is the name of the lambda's params-struct parameter, if it declared
@@ -106,14 +137,23 @@ func paramNameAt(params []lambdaParam, index int) string {
 }
 
 func newParseContext(schema *models.Model, paramName string) *parseContext {
-	return &parseContext{
+	pctx := &parseContext{
 		schema:       schema,
 		paramName:    paramName,
 		sentinels:    make(map[string]*rangeSentinel),
 		optionParams: make(map[string]string),
 		sortSpecs:    make(map[string]*query.SortSpec),
-		participants: map[string]*models.Model{paramName: schema},
+		joinSpecs:    make(map[string]*query.JoinSpec),
+		rowParams:    make(map[string]bool),
+		cteRows:      make(map[string]*query.ParseCTE),
+		participants: make(map[string]*models.Model),
 	}
+	// A projection lambda starts with no model: which one it reads from is stated by
+	// from.Model. Registering a nil under the empty name would put a hole in the map.
+	if schema != nil && paramName != "" {
+		pctx.participants[paramName] = schema
+	}
+	return pctx
 }
 
 // inherited marks a table as belonging to an enclosing lambda, so referencing it correlates
@@ -250,6 +290,22 @@ func (pctx *parseContext) classifyParams(funcLit *ast.FuncLit) error {
 				continue
 			}
 		}
+		// A slice of pointers stands for the rows a query has produced so far: the CTE being
+		// defined, referred to from inside its own definition.
+		if sliceOfPointers(param.typ) {
+			if param.name != "_" {
+				pctx.selfHandle = param.name
+			}
+			continue
+		}
+		// A pointer to something that is neither an option nor a model stands for a row of
+		// a query — a CTE's row handle. A params struct is passed by value.
+		if isPointer && !optionNames[typeName] {
+			if param.name != "_" {
+				pctx.rowParams[param.name] = true
+			}
+			continue
+		}
 		if !isPointer || !optionNames[typeName] {
 			if pctx.paramsName != "" {
 				return fmt.Errorf("%w: a lambda may declare at most one params struct",
@@ -265,18 +321,22 @@ func (pctx *parseContext) classifyParams(funcLit *ast.FuncLit) error {
 			continue
 		}
 		pctx.optionParams[param.name] = typeName
-		if typeName == "Sort" {
+		switch typeName {
+		case "Sort":
 			pctx.sortSpecs[param.name] = &query.SortSpec{}
 			pctx.sortOrder = append(pctx.sortOrder, param.name)
+		case "Join":
+			pctx.joinSpecs[param.name] = &query.JoinSpec{}
+			pctx.joinOrder = append(pctx.joinOrder, param.name)
 		}
 	}
 	return nil
 }
 
 // options assembles the parsed modifiers, or nil when the lambda declared none.
-func (pctx *parseContext) options() *query.Options {
-	if pctx.opts == nil && len(pctx.sortOrder) == 0 {
-		return nil
+func (pctx *parseContext) options() (*query.Options, error) {
+	if pctx.opts == nil && len(pctx.sortOrder) == 0 && len(pctx.joinOrder) == 0 {
+		return nil, nil
 	}
 	out := pctx.opts
 	if out == nil {
@@ -288,10 +348,27 @@ func (pctx *parseContext) options() *query.Options {
 			out.Sorts = append(out.Sorts, *spec)
 		}
 	}
-	if out.IsEmpty() {
-		return nil
+	for _, name := range pctx.joinOrder {
+		spec := pctx.joinSpecs[name]
+		switch {
+		case spec.Table == "" && spec.On == nil:
+			// Declared and never used. Harmless on its own, but it reads as an intent that
+			// was not carried out, so say so rather than emitting a query without the join.
+			return nil, fmt.Errorf("%w: join parameter %s is declared but never assigned — "+
+				"set %s.Model and %s.On, or remove it", ErrInvalidOption, name, name, name)
+		case spec.Table == "":
+			return nil, fmt.Errorf("%w: %s.Model is not set — a join needs the model it relates",
+				ErrInvalidOption, name)
+		case spec.On == nil:
+			return nil, fmt.Errorf("%w: %s.On is not set — a join needs the condition relating "+
+				"%s, which goql will not guess", ErrInvalidOption, name, spec.Table)
+		}
+		out.Joins = append(out.Joins, *spec)
 	}
-	return out
+	if out.IsEmpty() {
+		return nil, nil
+	}
+	return out, nil
 }
 
 // pointerTypeName returns the name of a pointer type's element, handling both
@@ -401,6 +478,9 @@ func (e *DebugExecutor) tryParseOptionAssignment(s *ast.AssignStmt, pctx *parseC
 
 	case "From":
 		return true, e.setFromModel(field, s.Rhs[0], pctx)
+
+	case "Join":
+		return true, e.setJoin(pctx.joinSpecs[base.Name], field, s.Rhs[0], pctx)
 
 	case "Group":
 		if field != "By" {
@@ -712,7 +792,7 @@ func (e *DebugExecutor) parseSource(source, call string) (*query.ParseQuery, err
 	// there is no reflect.Type to consult, so "is a model" means "its type name resolves to
 	// a registered one" — the same rule the runtime applies, expressed against the AST.
 	if !insert && sourceModelFromParam(params, 0) == nil {
-		return e.parseProjectionSource(funcLit, params)
+		return e.parseProjectionSource(funcLit, params, nil)
 	}
 
 	entity, err := resolveEntityTypeFromFuncLit(funcLit)
@@ -875,7 +955,11 @@ func (e *DebugExecutor) parseBody(funcLit *ast.FuncLit, pctx *parseContext) (*qu
 		})
 	}
 
-	result.Options = pctx.options()
+	opts, err := pctx.options()
+	if err != nil {
+		return nil, err
+	}
+	result.Options = opts
 	result.Joined = pctx.joined
 	return result, nil
 }
@@ -1291,6 +1375,19 @@ func (e *DebugExecutor) exprToCondition(expr ast.Expr, pctx *parseContext) (*que
 					"as the group being filtered", ErrUnsupportedExpr)
 		}
 
+		// A computed left-hand side: o.Price * o.Qty > 100.
+		if binary, ok := v.X.(*ast.BinaryExpr); ok && arithmeticOps[binary.Op.String()] {
+			leftValue, err := e.resolveArithmetic(binary, pctx)
+			if err != nil {
+				return nil, fmt.Errorf("left side: %w", err)
+			}
+			right, err := e.resolveValueRef(v.Y, pctx)
+			if err != nil {
+				return nil, fmt.Errorf("right side: %w", err)
+			}
+			return &query.ParseNode{LeftValue: leftValue, Operator: op, Right: right}, nil
+		}
+
 		left, err := e.resolveFieldRefIn(v.X, pctx)
 		if err != nil {
 			return nil, fmt.Errorf("left side: %w", err)
@@ -1358,6 +1455,20 @@ func (e *DebugExecutor) resolveFieldRefIn(expr ast.Expr, pctx *parseContext) (*q
 			ErrInvalidLambda, name)
 	}
 
+	// A column of the CTE this query reads from.
+	if ref, isCTE, err := pctx.cteColumn(expr); isCTE {
+		return ref, err
+	}
+
+	// A model of the enclosing query, deliberately not inherited here: this body may be read
+	// from as a CTE, which is evaluated before the outer query produces a row.
+	if name := baseIdentName(expr); pctx.outerNames[name] {
+		return nil, fmt.Errorf(
+			"%w: %s belongs to the enclosing query — a nested projection cannot reference it, "+
+				"because a query read from with from.Query is evaluated before the outer one",
+			ErrInvalidLambda, name)
+	}
+
 	// The destination row of an INSERT … SELECT does not exist yet, so it cannot be read
 	// from. Say that, rather than failing later with a confusing "field a not found".
 	if pctx.destSchema != nil && baseIdentName(expr) == pctx.destParamName {
@@ -1419,6 +1530,14 @@ func (e *DebugExecutor) resolveFieldRef(expr ast.Expr, schema *models.Model, par
 			return nil, fmt.Errorf("field %s not found in models %s", path[1], targetSchema.TableName)
 		}
 
+		// The primary key of a many2one target is the value the foreign key column already
+		// holds, so o.Customer.ID is customers.id only in spelling — it is orders.customer_id.
+		// Resolving it locally avoids a join that could only ever compare a column to itself,
+		// and it is what makes a foreign key comparable to a plain value.
+		if relationField.RelationKind() == models.M2O && nestedField.PrimaryKey {
+			return &query.FieldRef{Field: relationField}, nil
+		}
+
 		return &query.FieldRef{
 			Field:  relationField,
 			Nested: &query.FieldRef{Field: nestedField},
@@ -1438,6 +1557,18 @@ func (e *DebugExecutor) resolveValueRef(expr ast.Expr, pctx *parseContext) (*que
 		return ref, err
 	}
 
+	// Parentheses carry no meaning of their own: the grouping they expressed is already in
+	// the shape of the tree the Go parser built.
+	if paren, ok := expr.(*ast.ParenExpr); ok {
+		return e.resolveValueRef(paren.X, pctx)
+	}
+
+	// An arithmetic expression: prev.Depth + 1, o.Price * o.Qty. Nothing is stored — the
+	// expression renders inline and the engine evaluates it per row.
+	if binary, ok := expr.(*ast.BinaryExpr); ok && arithmeticOps[binary.Op.String()] {
+		return e.resolveArithmetic(binary, pctx)
+	}
+
 	// A bare identifier naming a declared model means that model's row: `o.Customer == c`
 	// compares the foreign key against the other model's primary key. This is how a nested
 	// predicate correlates with the enclosing one.
@@ -1449,6 +1580,15 @@ func (e *DebugExecutor) resolveValueRef(expr ast.Expr, pctx *parseContext) (*que
 			}
 			return &query.ValueRef{IsColumn: true, Field: &query.FieldRef{Field: other.PrimaryKey}}, nil
 		}
+	}
+
+	// A model of the enclosing query, which a nested projection deliberately does not
+	// inherit. Reported here too: the field-reference path below discards its error.
+	if name := baseIdentName(expr); pctx.outerNames[name] {
+		return nil, fmt.Errorf(
+			"%w: %s belongs to the enclosing query — a nested projection cannot reference it, "+
+				"because a query read from with from.Query is evaluated before the outer one",
+			ErrInvalidLambda, name)
 	}
 
 	// Check if it's a field reference first. A reference through another declared model
@@ -2021,4 +2161,71 @@ func recordedFunc(call string) string {
 	default:
 		return ""
 	}
+}
+
+// bindCTERow records the parameter standing for a row of a named query. References through
+// it resolve to that query's projected columns rather than to a schema.
+func (pctx *parseContext) bindCTERow(name string, cte *query.ParseCTE) {
+	pctx.cteRows[name] = cte
+	delete(pctx.rowParams, name)
+}
+
+// cteColumn resolves a reference through the CTE row handle — t.Total — to the column the
+// defining query projected under that name. The check is possible because the CTE's columns
+// are known: they are its projection.
+func (pctx *parseContext) cteColumn(expr ast.Expr) (*query.FieldRef, bool, error) {
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok {
+		return nil, false, nil
+	}
+	base, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return nil, false, nil
+	}
+	cte, bound := pctx.cteRows[base.Name]
+	if !bound {
+		return nil, false, nil
+	}
+
+	name := sel.Sel.Name
+	for _, column := range cte.Columns {
+		if column == name {
+			return &query.FieldRef{CTETable: cte.Name, CTEColumn: column}, true, nil
+		}
+	}
+	return nil, true, fmt.Errorf("%w: %s does not select %s — it selects %s",
+		models.ErrFieldNotFound, cte.Name, name, strings.Join(cte.Columns, ", "))
+}
+
+// applyCTE records the common table expression this query reads from, if any. The definition
+// travels with the body, so it survives into the generated prod registry like everything else.
+func (pctx *parseContext) applyCTE(parsed *query.ParseQuery) {
+	if pctx.cte == nil {
+		return
+	}
+	parsed.From = pctx.cte.Name
+	parsed.Body.With = append(parsed.Body.With, pctx.cte)
+}
+
+// outerParamNames collects the enclosing lambda's model parameter names.
+func outerParamNames(outer *parseContext) map[string]bool {
+	if outer == nil {
+		return nil
+	}
+	names := make(map[string]bool, len(outer.participants))
+	for name := range outer.participants {
+		names[name] = true
+	}
+	return names
+}
+
+// sliceOfPointers reports a parameter written []*T, the shape a goql call returns and
+// therefore the shape of a handle on a query's rows.
+func sliceOfPointers(expr ast.Expr) bool {
+	array, ok := expr.(*ast.ArrayType)
+	if !ok || array.Len != nil {
+		return false
+	}
+	_, isPointer := array.Elt.(*ast.StarExpr)
+	return isPointer
 }

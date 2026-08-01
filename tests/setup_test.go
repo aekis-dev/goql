@@ -129,3 +129,4 @@ type Tag = testmodels.Tag
 type OrderArchive = testmodels.OrderArchive
 type Invoice = testmodels.Invoice
 type Payment = testmodels.Payment
+type Category = testmodels.Category

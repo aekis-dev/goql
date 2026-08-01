@@ -266,6 +266,7 @@ var optionTypes = map[reflect.Type]bool{
 	reflect.TypeFor[Conflict](): true,
 	reflect.TypeFor[From]():     true,
 	reflect.TypeFor[Group]():    true,
+	reflect.TypeFor[Join]():     true,
 }
 
 // lambdaParams validates a lambda and reconciles its params-struct parameter, if any,
@@ -380,6 +381,11 @@ func paramsTypeFrom(fnType reflect.Type, start int) (reflect.Type, error) {
 		}
 		// A pointer to another model is a join participant, not the params struct.
 		if isEntityParam(fnType, i) {
+			continue
+		}
+		// A pointer to anything else stands for a row — of a CTE the body reads from.
+		// A params struct is passed by value, which is what distinguishes them.
+		if in.Kind() == reflect.Ptr {
 			continue
 		}
 		if paramsType != nil {

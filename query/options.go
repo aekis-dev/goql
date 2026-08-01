@@ -40,6 +40,35 @@ type Options struct {
 	// ConflictIgnore skips rows that collide with an existing one instead of failing.
 	// Only Insert honours it; the other calls reject it rather than ignore it.
 	ConflictIgnore bool
+
+	// Joins are the explicit joins a lambda declared, in declaration order. A table joined
+	// here is related by its own ON condition, so it is not listed in the FROM clause.
+	Joins []JoinSpec
+}
+
+// JoinSpec is one explicit join: the table, the kind, and the condition relating it.
+type JoinSpec struct {
+	Table string
+	Type  string
+	On    *ParseNode
+
+	// CTE marks a join against a named query rather than a table. It changes nothing in the
+	// rendering — a CTE is referenced by name — but it is what identifies a recursive term.
+	CTE bool
+}
+
+// JoinsTable reports whether an explicit join already brings this table into the statement,
+// so the FROM list does not name it a second time.
+func (o *Options) JoinsTable(table string) bool {
+	if o == nil {
+		return false
+	}
+	for _, join := range o.Joins {
+		if join.Table == table {
+			return true
+		}
+	}
+	return false
 }
 
 // columnFor resolves a Go field name to its qualified, quoted column.
@@ -155,5 +184,6 @@ func (o *Options) IsEmpty() bool {
 		len(o.Fields) == 0 &&
 		!o.PreloadSet &&
 		len(o.GroupBy) == 0 &&
-		!o.ConflictIgnore
+		!o.ConflictIgnore &&
+		len(o.Joins) == 0
 }

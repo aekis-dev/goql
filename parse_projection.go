@@ -40,11 +40,28 @@ var aggregateMarkers = map[string]string{
 // from. The right-hand side is one of the lambda's own model parameters, so the declaration
 // and the query cannot disagree.
 func (e *DebugExecutor) setFromModel(field string, rhs ast.Expr, pctx *parseContext) error {
-	if field != "Model" {
+	switch field {
+	case "Query":
+		return e.setFromQuery(rhs, pctx)
+	case "Model":
+	default:
 		return fmt.Errorf("%w: From has no field %s", ErrInvalidOption, field)
 	}
 
 	name := baseIdentName(rhs)
+
+	// With a CTE bound, from.Model names the handle for one of its rows rather than a
+	// model — the CTE's columns are its defining query's projection.
+	if pctx.cte != nil {
+		if name == "" || !pctx.rowParams[name] {
+			return fmt.Errorf(
+				"%w: from.Model must name the lambda parameter standing for a row of %s, got %s",
+				ErrInvalidLambda, pctx.cte.Name, types.ExprString(rhs))
+		}
+		pctx.bindCTERow(name, pctx.cte)
+		return nil
+	}
+
 	schema, declared := pctx.participants[name]
 	if !declared {
 		return fmt.Errorf(
@@ -54,6 +71,37 @@ func (e *DebugExecutor) setFromModel(field string, rhs ast.Expr, pctx *parseCont
 
 	pctx.schema = schema
 	pctx.paramName = name
+	return nil
+}
+
+// setFromQuery handles `from.Query = totals`, which reads from a query bound earlier in the
+// body instead of from a table. The CTE takes the Go variable's name, so the name is stated
+// once and cannot drift.
+func (e *DebugExecutor) setFromQuery(rhs ast.Expr, pctx *parseContext) error {
+	name := baseIdentName(rhs)
+	sub, bound := pctx.subqueries[name]
+	if !bound {
+		return fmt.Errorf(
+			"%w: from.Query must name a query bound in this lambda (x, _ := goql.Select[…]), got %s",
+			ErrInvalidLambda, types.ExprString(rhs))
+	}
+	if sub.Func != "" {
+		return fmt.Errorf("%w: %s is a nested %s, which yields a value rather than rows to read from",
+			ErrInvalidLambda, name, displayFunc(sub.Func))
+	}
+	if len(sub.Body.Select) == 0 && sub.Body.Set == nil {
+		return fmt.Errorf(
+			"%w: %s selects whole %s rows, so it has no named columns to read — project the "+
+				"columns the outer query needs", ErrInvalidLambda, name, sub.Model)
+	}
+	columns := projectedColumns(sub.Body)
+
+	// A self-reference carries a placeholder until now: the Go binding is what names the CTE,
+	// and that name is only known here. Finding one is also what makes the query recursive.
+	recursive := nameSelfReferences(sub, name)
+
+	pctx.cte = &query.ParseCTE{Name: name, Columns: columns, Query: sub, Recursive: recursive}
+	delete(pctx.subqueries, name)
 	return nil
 }
 
@@ -93,6 +141,23 @@ func (e *DebugExecutor) tryParseProjection(s *ast.AssignStmt, pctx *parseContext
 				ErrUnsupportedExpr, types.ExprString(call.Fun))
 		}
 		return e.projectionFromMarker(fn, call, into, pctx)
+	}
+
+	// A computed column: an expression over source columns, or a constant. Nothing is
+	// stored — it is rendered into the SELECT list and evaluated per row.
+	if binary, isBinary := s.Rhs[0].(*ast.BinaryExpr); isBinary && arithmeticOps[binary.Op.String()] {
+		value, err := e.resolveArithmetic(binary, pctx)
+		if err != nil {
+			return nil, fmt.Errorf("projected column %s: %w", into, err)
+		}
+		return &query.ParseSelect{Value: value, Into: into}, nil
+	}
+	if _, isLiteral := s.Rhs[0].(*ast.BasicLit); isLiteral {
+		value, err := e.resolveValueRef(s.Rhs[0], pctx)
+		if err != nil {
+			return nil, fmt.Errorf("projected column %s: %w", into, err)
+		}
+		return &query.ParseSelect{Value: value, Into: into}, nil
 	}
 
 	ref, err := e.resolveFieldRefIn(s.Rhs[0], pctx)
@@ -136,6 +201,11 @@ func checkAggregateColumn(fn string, ref *query.FieldRef) error {
 	switch fn {
 	case "Sum", "Avg":
 	default:
+		return nil
+	}
+	// A column of a CTE has no declared type here: its type is whatever the defining query
+	// projected, which was checked while that query was parsed.
+	if ref.Field == nil {
 		return nil
 	}
 	field := ref.Field
@@ -193,7 +263,7 @@ func (e *DebugExecutor) parseProjectionLambda(fn any, funcType reflect.Type, fun
 	// A set operation is the query: its branches carry the models and the projections, so the
 	// combining lambda declares neither.
 	if body.Set == nil {
-		if pctx.schema == nil {
+		if pctx.schema == nil && pctx.cte == nil {
 			return nil, fmt.Errorf(
 				"%w: %s does not say which model to read from — assign one of the lambda's model "+
 					"parameters to a *goql.From, e.g. from.Model = o",
@@ -207,6 +277,7 @@ func (e *DebugExecutor) parseProjectionLambda(fn any, funcType reflect.Type, fun
 	}
 
 	parsed := &query.ParseQuery{Model: modelName(pctx.schema), Body: body}
+	pctx.applyCTE(parsed)
 	if err := query.ValidateQuery(parsed, false); err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidLambda, err)
 	}
@@ -218,9 +289,28 @@ func (e *DebugExecutor) parseProjectionLambda(fn any, funcType reflect.Type, fun
 // parseProjectionSource is parseProjectionLambda for the generator, which has source text
 // rather than runtime types. The result type's fields cannot be checked here — the Go
 // compiler has already done that at the call site.
-func (e *DebugExecutor) parseProjectionSource(funcLit *ast.FuncLit, params []lambdaParam) (*query.ParseQuery, error) {
+func (e *DebugExecutor) parseProjectionSource(funcLit *ast.FuncLit, params []lambdaParam, outer *parseContext) (*query.ParseQuery, error) {
 	pctx := newParseContext(nil, "")
-	pctx.resultName = paramNameAt(params, 0)
+
+	// A combining lambda declares no result: its branches carry the projection. A leading
+	// []*T parameter is instead the handle on the query being defined, which its branches
+	// join to recurse.
+	if len(params) > 0 && sliceOfPointers(params[0].typ) {
+		pctx.selfHandle = params[0].name
+	} else {
+		pctx.resultName = paramNameAt(params, 0)
+	}
+	// A nested projection does not inherit the enclosing models: it may become a CTE, which
+	// is evaluated before the outer query has a row. Their names are remembered only so
+	// referencing one is reported for what it is.
+	pctx.outerNames = outerParamNames(outer)
+	if outer != nil && pctx.selfHandle == "" {
+		// A branch of a recursive CTE may join the CTE being defined, whose handle is
+		// declared by the combining lambda around it — inherited only when this lambda is
+		// not itself the one declaring it.
+		pctx.selfHandle = outer.selfHandle
+		pctx.selfColumns = outer.selfColumns
+	}
 
 	for i := 1; i < len(params); i++ {
 		if schema := sourceModelFromParam(params, i); schema != nil {
@@ -237,7 +327,7 @@ func (e *DebugExecutor) parseProjectionSource(funcLit *ast.FuncLit, params []lam
 	}
 
 	if body.Set == nil {
-		if pctx.schema == nil {
+		if pctx.schema == nil && pctx.cte == nil {
 			return nil, fmt.Errorf(
 				"%w: the query does not say which model to read from — assign one of the lambda's "+
 					"model parameters to a *goql.From, e.g. from.Model = o", ErrInvalidLambda)
@@ -248,6 +338,7 @@ func (e *DebugExecutor) parseProjectionSource(funcLit *ast.FuncLit, params []lam
 	}
 
 	parsed := &query.ParseQuery{Model: modelName(pctx.schema), Body: body}
+	pctx.applyCTE(parsed)
 	if err := query.ValidateQuery(parsed, false); err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidLambda, err)
 	}
@@ -276,4 +367,18 @@ func modelName(schema *models.Model) string {
 		return ""
 	}
 	return schema.Type.Name()
+}
+
+// projectedColumns lists the columns a body produces. A set operation carries its projection
+// on its branches — they are checked to agree — so the first branch names them.
+func projectedColumns(body *query.ParseBody) []string {
+	selects := body.Select
+	if body.Set != nil && len(body.Set.Branches) > 0 {
+		selects = body.Set.Branches[0].Body.Select
+	}
+	columns := make([]string, 0, len(selects))
+	for _, sel := range selects {
+		columns = append(columns, sel.Into)
+	}
+	return columns
 }

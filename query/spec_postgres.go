@@ -151,3 +151,10 @@ var postgresTypeAliases = map[string]string{
 func (Postgres) NormalizeType(declared string) string {
 	return normalizeWithAliases(declared, postgresTypeAliases)
 }
+
+// Postgres has every join kind.
+func (Postgres) SupportsJoinType(string) bool { return true }
+
+func (Postgres) Concat(left, right string) string { return fmt.Sprintf("(%s || %s)", left, right) }
+
+func (Postgres) SupportsCTE() bool { return true }

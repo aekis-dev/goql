@@ -22,15 +22,42 @@ type ParseQuery struct {
 	// It is the API's own name — Count, Exists, … — not a separate vocabulary.
 	Func string
 
+	// From names a common table expression this query reads from instead of a table. The
+	// definition lives in the enclosing body's With list.
+	From string
+
 	Body *ParseBody
 }
 
 // Schema resolves the model this query runs against.
+//
+// A query reading from a CTE has no registered model: its "table" is the named query, and
+// its columns are that query's projection. SchemaOf builds the stand-in.
 func (q *ParseQuery) Schema() (*models.Model, error) {
-	if q == nil || q.Model == "" {
+	if q == nil {
+		return nil, fmt.Errorf("parsed query names no model")
+	}
+	if q.From != "" {
+		return nil, fmt.Errorf("query reads from %s, which needs its definition to resolve", q.From)
+	}
+	if q.Model == "" {
 		return nil, fmt.Errorf("parsed query names no model")
 	}
 	return models.SchemaByName(q.Model)
+}
+
+// SchemaIn resolves the schema, using the enclosing body's CTE definitions when this query
+// reads from one rather than from a table.
+func (q *ParseQuery) SchemaIn(with []*ParseCTE) (*models.Model, error) {
+	if q != nil && q.From != "" {
+		for _, cte := range with {
+			if cte.Name == q.From {
+				return cte.Schema(), nil
+			}
+		}
+		return nil, fmt.Errorf("query reads from %s, which is not defined in this statement", q.From)
+	}
+	return q.Schema()
 }
 
 // funcSpec describes a goql function as data: how many fields it takes through goql.Fields,
@@ -183,4 +210,35 @@ var setOps = map[string]string{
 func SetOp(name string) (string, bool) {
 	op, ok := setOps[name]
 	return op, ok
+}
+
+// ParseCTE is one named query in a WITH clause: a query bound to a name inside a lambda and
+// then read from, rather than used as a value.
+//
+// Columns are the names the defining query projects, which are also this "table"'s columns.
+// They are carried as names because the definition has to survive into the generated prod
+// registry as literals, like everything else in the tree.
+type ParseCTE struct {
+	Name    string
+	Columns []string
+	Query   *ParseQuery
+
+	// Recursive marks a definition that references itself. It is derived from that
+	// reference rather than declared, so the two cannot disagree.
+	Recursive bool
+}
+
+// Schema builds the stand-in model a CTE presents to the builders: its name is the table,
+// its projected columns are the fields. It is not registered — nothing outside this
+// statement can refer to it.
+func (c *ParseCTE) Schema() *models.Model {
+	schema := &models.Model{
+		TableName: c.Name,
+		Fields:    make(map[string]*models.Field, len(c.Columns)),
+	}
+	for _, column := range c.Columns {
+		field := &models.Field{Name: column, Column: column, TableSchema: schema}
+		schema.Fields[column] = field
+	}
+	return schema
 }

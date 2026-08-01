@@ -61,8 +61,14 @@ func (d *Dialect) lambdaWriteBranch(branch *ParseBranch, schema *models.Model) (
 			col = d.QuoteIdent(field.GetFKColumn())
 		}
 
-		if assignment.Value.IsColumn {
-			setClauses = append(setClauses, fmt.Sprintf("%s = %s", col, s.column(assignment.Value.Field)))
+		// A column or a computed expression: o.Total = o.Total * 1.1.
+		if assignment.Value.IsColumn || assignment.Value.IsExpr() {
+			expr, exprArgs, err := d.valueSQL(assignment.Value, s)
+			if err != nil {
+				return nil, fmt.Errorf("field %s: %w", field.Name, err)
+			}
+			setClauses = append(setClauses, fmt.Sprintf("%s = %s", col, expr))
+			args = append(args, exprArgs...)
 			continue
 		}
 

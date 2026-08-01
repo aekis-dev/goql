@@ -137,3 +137,15 @@ var mysqlTypeAliases = map[string]string{
 func (MySQL) NormalizeType(declared string) string {
 	return normalizeWithAliases(declared, mysqlTypeAliases)
 }
+
+// MySQL has no FULL JOIN; the usual workaround is a union of a LEFT and a RIGHT join,
+// which is a different statement and not something goql will substitute silently.
+func (MySQL) SupportsJoinType(kind string) bool { return kind != "FULL" }
+
+// MySQL reads "||" as logical OR unless PIPES_AS_CONCAT is set, so CONCAT is the only
+// spelling that is correct regardless of the server's SQL mode.
+func (MySQL) Concat(left, right string) string { return fmt.Sprintf("CONCAT(%s, %s)", left, right) }
+
+// MySQL gained WITH in 8.0. goql assumes a supported server, as it does for INTERSECT;
+// the derived-table fallback exists for a spec that answers false.
+func (MySQL) SupportsCTE() bool { return true }

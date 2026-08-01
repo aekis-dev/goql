@@ -54,6 +54,9 @@ func emitParseNode(node *query.ParseNode, depth int) string {
 	if node.Left != nil {
 		fields = append(fields, fmt.Sprintf("%sLeft: %s,", ind1, emitFieldRef(node.Left)))
 	}
+	if node.LeftValue != nil {
+		fields = append(fields, fmt.Sprintf("%sLeftValue: %s,", ind1, emitValueRef(node.LeftValue)))
+	}
 	if node.RawColumn != "" {
 		fields = append(fields, fmt.Sprintf("%sRawColumn: %q,", ind1, node.RawColumn))
 	}
@@ -93,6 +96,9 @@ func emitParseQuery(q *query.ParseQuery, depth int) string {
 	if q.Func != "" {
 		fields = append(fields, fmt.Sprintf("%sFunc: %q,", ind1, q.Func))
 	}
+	if q.From != "" {
+		fields = append(fields, fmt.Sprintf("%sFrom: %q,", ind1, q.From))
+	}
 	fields = append(fields, fmt.Sprintf("%sBody: %s,", ind1, emitParsedBody(q.Body, depth+1)))
 
 	return fmt.Sprintf("&query.ParseQuery{\n%s\n%s}", strings.Join(fields, "\n"), ind)
@@ -101,6 +107,11 @@ func emitParseQuery(q *query.ParseQuery, depth int) string {
 func emitFieldRef(ref *query.FieldRef) string {
 	if ref == nil {
 		return "nil"
+	}
+	// A CTE column names a query's projection, not a registered schema, so there is nothing
+	// to resolve at init time — the names are the whole reference.
+	if ref.CTETable != "" {
+		return fmt.Sprintf("&query.FieldRef{CTETable: %q, CTEColumn: %q}", ref.CTETable, ref.CTEColumn)
 	}
 
 	tableName := ref.Field.TableSchema.TableName
@@ -120,6 +131,12 @@ func emitValueRef(ref *query.ValueRef) string {
 	}
 	if ref.IsColumn {
 		return fmt.Sprintf("&query.ValueRef{IsColumn: true, Field: %s}", emitFieldRef(ref.Field))
+	}
+	// A computed value is a tree of its own; %#v would write its pointers as a literal.
+	if ref.Expr != nil {
+		return fmt.Sprintf("&query.ValueRef{Expr: &query.ParseExpr{Op: %q, Text: %v, Left: %s, Right: %s}}",
+			ref.Expr.Op, ref.Expr.Text,
+			emitValueRef(ref.Expr.Left), emitValueRef(ref.Expr.Right))
 	}
 	// A params reference must be reconstructed as the placeholder type, not as its
 	// literal Go value.
@@ -209,6 +226,16 @@ func emitOptions(opts *query.Options, depth int) string {
 	if opts.ConflictIgnore {
 		fields = append(fields, "ConflictIgnore: true")
 	}
+	// An explicit join carries a whole condition tree, so it is emitted like one rather
+	// than through %#v, which would write the node's pointers as a literal struct.
+	if len(opts.Joins) > 0 {
+		specs := make([]string, len(opts.Joins))
+		for i, join := range opts.Joins {
+			specs[i] = fmt.Sprintf("{Table: %q, Type: %q, CTE: %v, On: %s}",
+				join.Table, join.Type, join.CTE, emitParseNode(join.On, depth+2))
+		}
+		fields = append(fields, fmt.Sprintf("Joins: []query.JoinSpec{%s}", strings.Join(specs, ", ")))
+	}
 
 	if len(fields) == 0 {
 		return "&query.Options{}"
@@ -253,6 +280,9 @@ func emitSelect(sel *query.ParseSelect) string {
 	if sel.Field != nil {
 		fields = append(fields, fmt.Sprintf("Field: %s", emitFieldRef(sel.Field)))
 	}
+	if sel.Value != nil {
+		fields = append(fields, fmt.Sprintf("Value: %s", emitValueRef(sel.Value)))
+	}
 	if sel.Into != "" {
 		fields = append(fields, fmt.Sprintf("Into: %q", sel.Into))
 	}
@@ -286,14 +316,16 @@ func emitParsedBody(body *query.ParseBody, depth int) string {
 	ind2 := indent(depth + 2)
 
 	if len(body.Branches) == 0 {
-		if body.Options == nil && len(body.Joined) == 0 && len(body.Select) == 0 && body.Set == nil {
+		if body.Options == nil && len(body.Joined) == 0 && len(body.Select) == 0 &&
+			body.Set == nil && len(body.With) == 0 {
 			return "&query.ParseBody{}"
 		}
-		return fmt.Sprintf("&query.ParseBody{\n%sOptions: %s,\n%sJoined: %s,\n%sSelect: %s,\n%sSet: %s,\n%s}",
+		return fmt.Sprintf("&query.ParseBody{\n%sOptions: %s,\n%sJoined: %s,\n%sSelect: %s,\n%sSet: %s,\n%sWith: %s,\n%s}",
 			ind1, emitOptions(body.Options, depth+1),
 			ind1, emitStringSlice(body.Joined),
 			ind1, emitProjection(body.Select, depth+1),
-			ind1, emitSet(body.Set, depth+1), ind)
+			ind1, emitSet(body.Set, depth+1),
+			ind1, emitWith(body.With, depth+1), ind)
 	}
 
 	branches := make([]string, len(body.Branches))
@@ -302,7 +334,7 @@ func emitParsedBody(body *query.ParseBody, depth int) string {
 	}
 
 	return fmt.Sprintf(
-		"&query.ParseBody{\n%sBranches: []*query.ParseBranch{\n%s%s,\n%s},\n%sOptions: %s,\n%sJoined: %s,\n%sSelect: %s,\n%sSet: %s,\n%s}",
+		"&query.ParseBody{\n%sBranches: []*query.ParseBranch{\n%s%s,\n%s},\n%sOptions: %s,\n%sJoined: %s,\n%sSelect: %s,\n%sSet: %s,\n%sWith: %s,\n%s}",
 		ind1,
 		ind2, strings.Join(branches, fmt.Sprintf(",\n%s", ind2)),
 		ind1,
@@ -310,5 +342,21 @@ func emitParsedBody(body *query.ParseBody, depth int) string {
 		ind1, emitStringSlice(body.Joined),
 		ind1, emitProjection(body.Select, depth+1),
 		ind1, emitSet(body.Set, depth+1),
+		ind1, emitWith(body.With, depth+1),
 		ind)
+}
+
+// emitWith reconstructs the common table expressions a body defines. Each is a whole query,
+// so it is emitted like one.
+func emitWith(with []*query.ParseCTE, depth int) string {
+	if len(with) == 0 {
+		return "nil"
+	}
+	parts := make([]string, len(with))
+	for i, cte := range with {
+		parts[i] = fmt.Sprintf("{Name: %q, Columns: %s, Recursive: %v, Query: %s}",
+			cte.Name, emitStringSlice(cte.Columns), cte.Recursive,
+			emitParseQuery(cte.Query, depth+1))
+	}
+	return fmt.Sprintf("[]*query.ParseCTE{%s}", strings.Join(parts, ", "))
 }

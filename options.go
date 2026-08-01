@@ -79,6 +79,7 @@ var optionNames = map[string]bool{
 	"Conflict": true,
 	"From":     true,
 	"Group":    true,
+	"Join":     true,
 }
 
 // buildOptions folds trailing option values from a struct-based call into the query
@@ -146,6 +147,71 @@ type (
 // query reads from that model and no From is needed.
 type From struct {
 	Model any
+
+	// Query reads from a named query — a common table expression — instead of a table:
+	//
+	//	totals, _ := goql.Select[CustomerTotal](ctx, e, …)
+	//	from.Query = totals
+	//	from.Model = t          // t *CustomerTotal is a row of it
+	//
+	// The CTE is named after the Go variable it was bound to, so the name is stated once.
+	// A CTE is evaluated before the outer query has a row, so its body may not reference
+	// the outer query — that is a correlated subquery, which only IN and EXISTS can take.
+	Query any
+}
+
+// JoinType is the kind of join an explicit Join performs.
+type JoinType string
+
+const (
+	Inner JoinType = "INNER"
+	Left  JoinType = "LEFT"
+	Right JoinType = "RIGHT"
+	Full  JoinType = "FULL"
+)
+
+// Join relates another declared model to the query explicitly, stating the condition
+// rather than leaving it to be inferred:
+//
+//	func(i *Invoice, p *Payment, j *goql.Join) bool {
+//	    j.Model = p
+//	    j.On    = i.Ref == p.Ref
+//	    j.Type  = goql.Left
+//	    return p.Method == "card"
+//	}
+//
+// Model names one of the lambda's own model parameters, the way From does — pointing at the
+// declaration rather than restating it. On is the join condition; like every expression in a
+// lambda it is parsed, not evaluated. Type defaults to Inner.
+//
+// Declare several *Join parameters to join several models. A comparison between two declared
+// models is still read as a join condition without a Join carrier, which stays the shorter
+// spelling for the inner-join case; an explicit Join is what makes the kind sayable.
+//
+// Not every engine has every kind: MySQL has no FULL JOIN, and SQLite gained RIGHT and FULL
+// in 3.39. An unsupported kind is refused while building the statement.
+type Join struct {
+	Model any
+	On    bool
+	Type  JoinType
+
+	// Query joins a named query instead of a table — a CTE bound in this lambda, or the
+	// CTE being defined, which is what makes a recursive one recursive:
+	//
+	//	tree, _ := goql.Select[CatNode](ctx, e, func(t []*CatNode) bool {
+	//	    …
+	//	    children, _ := goql.Select[CatNode](ctx, e,
+	//	        func(n *CatNode, prev *CatNode, c *Category, f *goql.From, j *goql.Join) bool {
+	//	            j.Query, j.Model = t, prev     // ← join the CTE to itself
+	//	            j.On = c.Parent.ID == prev.ID
+	//	            …
+	//	        })
+	//	    return goql.UnionAll(roots, children)
+	//	})
+	//
+	// The self-reference is declared as the combining lambda's own parameter — `t []*CatNode`,
+	// the rows produced so far — so recursion is stated in the source rather than inferred.
+	Query any
 }
 
 // Group names extra grouping keys for a projection, as Go field names:

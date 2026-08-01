@@ -24,23 +24,51 @@ type JoinClause struct {
 type FieldRef struct {
 	Field  *models.Field
 	Nested *FieldRef
+
+	// CTETable and CTEColumn name a column of a common table expression, which has no
+	// registered schema — its columns are whatever the defining query projected.
+	CTETable  string
+	CTEColumn string
 }
 
 // TableName returns the table name for this field reference
 func (fr *FieldRef) TableName() string {
+	if fr.CTETable != "" {
+		return fr.CTETable
+	}
 	if fr.Nested != nil {
 		return fr.Nested.Field.TableSchema.TableName
 	}
 	return fr.Field.TableSchema.TableName
 }
 
-// ValueRef represents the right-hand side of a comparison or assignment.
-// Either a literal value or a reference to another field.
+// ValueRef represents the right-hand side of a comparison or assignment: a literal, a
+// reference to another field, or an arithmetic expression over either.
 type ValueRef struct {
 	IsColumn bool
 	Field    *FieldRef // when IsColumn = true
-	Value    any       // when IsColumn = false
+	Value    any       // when IsColumn = false and Expr = nil
+
+	// Expr is set when the value is computed rather than read: prev.Depth + 1. Nothing is
+	// stored — the expression is rendered inline and evaluated per row by the engine.
+	Expr *ParseExpr
 }
+
+// ParseExpr is an arithmetic expression. Operands are themselves ValueRefs, so expressions
+// nest; precedence and grouping are already resolved by the Go parser, which built the tree.
+type ParseExpr struct {
+	Op          string // + - * / %
+	Left, Right *ValueRef
+
+	// Text marks a "+" that concatenates rather than adds. It is decided while parsing,
+	// from the Go types of the operands, because the engines disagree: SQLite and Postgres
+	// spell concatenation ||, and MySQL needs CONCAT — where a bare + would silently
+	// coerce both sides to numbers and yield 0.
+	Text bool
+}
+
+// IsExpr reports whether this value is computed.
+func (v *ValueRef) IsExpr() bool { return v != nil && v.Expr != nil }
 
 // ParseNode is a node in the parsed condition tree.
 // Leaf nodes represent a single comparison (Left Operator Right).
@@ -50,6 +78,10 @@ type ParseNode struct {
 	Left     *FieldRef
 	Operator string
 	Right    *ValueRef
+
+	// LeftValue replaces Left when the left-hand side is computed rather than a plain
+	// column: o.Price * o.Qty > 100.
+	LeftValue *ValueRef
 
 	// RawColumn overrides Left with a fragment emitted verbatim, the escape hatch for
 	// expressions goql cannot model — a JSON path, say. The caller owns its correctness
@@ -149,6 +181,9 @@ type ParseBody struct {
 	// Set combines whole queries — UNION and its relatives. When set, it is the query: the
 	// body's own branches describe nothing on their own.
 	Set *ParseSet
+
+	// With holds the common table expressions this body defines, in declaration order.
+	With []*ParseCTE
 
 	// Joined lists the tables of additional models the lambda declared as parameters and
 	// actually referenced. They enter the FROM clause alongside the primary table, and a
@@ -264,6 +299,16 @@ func containsValue(slice []any, value any) bool {
 // a multi-table FROM list. Silently ignoring the parameter would run the statement against
 // the wrong row set.
 func rejectJoined(body *ParseBody, call string) error {
+	if body.Options != nil && len(body.Options.Joins) > 0 {
+		tables := make([]string, len(body.Options.Joins))
+		for i, join := range body.Options.Joins {
+			tables[i] = join.Table
+		}
+		return fmt.Errorf(
+			"%s cannot take an explicit join (%s): it reaches other tables through declared "+
+				"relations, not a join list",
+			call, strings.Join(tables, ", "))
+	}
 	if len(body.Joined) == 0 {
 		return nil
 	}
@@ -284,6 +329,10 @@ type ParseSelect struct {
 
 	// Field is the source column. Nil for COUNT(*), which counts rows rather than values.
 	Field *FieldRef
+
+	// Value is set instead of Field when the column is computed — an expression, or a
+	// literal assigned straight into a result field.
+	Value *ValueRef
 
 	// Into names the field of the result type this column is scanned into. It is also the
 	// column's SQL alias, so scanning never depends on column order.

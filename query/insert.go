@@ -69,8 +69,13 @@ func (d *Dialect) lambdaInsertBranch(body *ParseBody, branch *ParseBranch, dest,
 
 		// A source field is selected; anything else is bound and selected as a constant,
 		// which is how literals and params-struct values reach every inserted row.
-		if assignment.Value.IsColumn {
-			selected = append(selected, s.column(assignment.Value.Field))
+		if assignment.Value.IsColumn || assignment.Value.IsExpr() {
+			expr, exprArgs, err := d.valueSQL(assignment.Value, s)
+			if err != nil {
+				return nil, fmt.Errorf("field %s: %w", field.Name, err)
+			}
+			selected = append(selected, expr)
+			args = append(args, exprArgs...)
 			continue
 		}
 

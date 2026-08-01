@@ -44,6 +44,20 @@ type Spec interface {
 	// requires UPDATE … JOIN … SET.
 	SupportsUpdateFrom() bool
 
+	// SupportsCTE reports whether WITH is available. MySQL gained it in 8.0; goql falls
+	// back to an inline derived table where it is not, repeating the subquery if it is
+	// used more than once.
+	SupportsCTE() bool
+
+	// SupportsJoinType reports whether a join kind ("INNER", "LEFT", "RIGHT", "FULL") is
+	// available. MySQL has no FULL JOIN, and SQLite gained RIGHT and FULL in 3.39.
+	SupportsJoinType(kind string) bool
+
+	// Concat joins two string expressions. Go spells concatenation "+", which MySQL reads
+	// as arithmetic — coercing both sides to numbers and answering 0 — so this cannot be a
+	// token swap.
+	Concat(left, right string) string
+
 	// OpenEndedLimit renders a limit that excludes nothing, needed because an OFFSET
 	// requires a LIMIT before it.
 	OpenEndedLimit() string
@@ -144,6 +158,10 @@ func (s *stmt) column(ref *FieldRef) string {
 
 // columnName resolves the quoted column a field reference points at.
 func (d *Dialect) columnName(ref *FieldRef) string {
+	// A CTE column is named by the defining query's projection, not by a schema.
+	if ref.CTEColumn != "" {
+		return d.QuoteIdent(ref.CTEColumn)
+	}
 	if ref.Nested != nil {
 		return d.QuoteIdent(ref.Nested.Field.ColumnName())
 	}

@@ -93,6 +93,11 @@ func (s *stmt) fromList(body *ParseBody, schema *models.Model) string {
 		if seen[table] {
 			continue
 		}
+		// An explicit join brings its table in with its own ON condition, so naming it here
+		// too would cross-join it before that condition applied.
+		if body.Options.JoinsTable(table) {
+			continue
+		}
 		seen[table] = true
 		tables = append(tables, s.alias.From(table))
 	}

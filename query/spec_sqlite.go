@@ -144,3 +144,12 @@ func (SQLite) NormalizeType(declared string) string {
 		return "numeric"
 	}
 }
+
+// SQLite gained RIGHT and FULL JOIN in 3.39 (2022). goql allows them: the driver bundles a
+// far newer engine, and refusing them here would block the modern default.
+func (SQLite) SupportsJoinType(string) bool { return true }
+
+func (SQLite) Concat(left, right string) string { return fmt.Sprintf("(%s || %s)", left, right) }
+
+// SQLite has had WITH since 3.8.3 (2014); the bundled engine is far newer.
+func (SQLite) SupportsCTE() bool { return true }
