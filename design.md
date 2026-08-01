@@ -1787,3 +1787,19 @@ omitted columns**.
 from a passing test — `Condition` forms, composed sorts, a subquery projecting a named column,
 joining a CTE, inserting a model into itself, and `Conflict{Ignore}`. A change that invalidates
 the documentation now fails the suite.
+
+### Translations (2026-08-01)
+
+Spanish alongside English, English default, via `mkdocs-static-i18n` with the **suffix**
+structure: `index.md` is English, `index.es.md` its Spanish sibling.
+- **Rationale**: the folder structure (`docs/en/…`, `docs/es/…`) would have moved all 25
+  English pages for no gain. With suffixes the default language keeps plain filenames, so the
+  English site is byte-identical to what it was and a missing translation simply falls back.
+- Nav labels are translated in `mkdocs.yml` (`nav_translations`), so the sidebar is Spanish
+  too, and Material's language switcher appears automatically.
+- **Code and SQL blocks are identical across languages** — only prose is translated. A reader
+  comparing the two pages sees the same generated SQL.
+- Verified: `mkdocs build --strict` builds both, and a script checks that every internal link
+  *and every `#anchor`* resolves in the built HTML for both languages — accented Spanish
+  headings slugify to unaccented ids (`## Terminación` → `#terminacion`), which is exactly the
+  kind of thing `--strict` does not catch.

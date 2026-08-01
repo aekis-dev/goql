@@ -134,33 +134,33 @@ SQLite 3.8.3+, every PostgreSQL, MySQL 8.0+.
 ## A shorter example: descendants of one node
 
 ```go
-type Node struct{ ID int64; Name string }
-
-descendants, err := goql.Select[Node](ctx, e,
-    func(out *Node, n *Node2, from *goql.From) bool {
-        sub, _ := goql.Select[Node2](ctx, e, func(t []*Node2) bool {
-            seed, _ := goql.Select[Node2](ctx, e,
-                func(r *Node2, c *Category, f *goql.From, p RootID) bool {
+rows, err := goql.Select[TreeSummary](ctx, e,
+    func(s *TreeSummary, n *CatNode, from *goql.From, p RootID) bool {
+        sub, _ := goql.Select[CatNode](ctx, e, func(t []*CatNode) bool {
+            seed, _ := goql.Select[CatNode](ctx, e,
+                func(r *CatNode, c *Category, f *goql.From) bool {
                     f.Model = c
-                    r.ID, r.Name = c.ID, c.Name
+                    r.ID, r.Name, r.Depth = c.ID, c.Name, 0
                     return c.ID == p.Value
                 })
-            kids, _ := goql.Select[Node2](ctx, e,
-                func(r *Node2, prev *Node2, c *Category, f *goql.From, j *goql.Join) bool {
+            kids, _ := goql.Select[CatNode](ctx, e,
+                func(r *CatNode, prev *CatNode, c *Category, f *goql.From, j *goql.Join) bool {
                     f.Model = c
                     j.Query, j.Model = t, prev
                     j.On = c.Parent.ID == prev.ID
                     r.ID, r.Name = c.ID, c.Name
-                    return true
+                    r.Depth = prev.Depth + 1
+                    return prev.Depth < 10
                 })
             return goql.UnionAll(seed, kids)
         })
         from.Query, from.Model = sub, n
-        out.ID, out.Name = n.ID, n.Name
+        s.Nodes = goql.Count()
+        s.Deepest = goql.Max(n.Depth)
         return true
     }, RootID{Value: 42})
 ```
 
-Note the [params struct](params.md) reaching into the anchor: the starting node is runtime
-data, so it travels the same way every other call-time value does. Without a depth column this
-walk relies on the data being acyclic — use `Union` if it might not be.
+Note the [params struct](params.md) reaching all the way into the anchor: the starting node is
+runtime data, so it travels like any other call-site value. The struct is declared **once, on
+the outermost lambda**, and is in scope for every nested body.

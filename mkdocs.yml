@@ -27,6 +27,56 @@ theme:
         icon: material/weather-sunny
         name: Switch to light mode
 
+plugins:
+  - search
+  # Suffix structure: index.md is English, index.es.md is its Spanish sibling. English is
+  # the default, so its pages keep the plain filenames and the untranslated site is
+  # unaffected.
+  - i18n:
+      docs_structure: suffix
+      reconfigure_material: true
+      reconfigure_search: true
+      languages:
+        - locale: en
+          name: English
+          default: true
+          build: true
+        - locale: es
+          name: Español
+          build: true
+          site_name: goql
+          site_description: Un ORM para Go donde las consultas se escriben como funciones Go.
+          nav_translations:
+            Home: Inicio
+            Getting started: Primeros pasos
+            Core concepts: Conceptos básicos
+            "Lambdas are parsed, not executed": "Las lambdas se analizan, no se ejecutan"
+            Declaring models: Declarar modelos
+            Runtime values (params): Valores en tiempo de ejecución (params)
+            Writing queries: Escribir consultas
+            Struct calls (by example): Llamadas con structs (por ejemplo)
+            Predicates and conditions: Predicados y condiciones
+            Query options: Opciones de consulta
+            Relations and preloading: Relaciones y precarga
+            Joins: Joins
+            Expressions: Expresiones
+            Aggregates and projections: Agregados y proyecciones
+            Grouping and HAVING: Agrupación y HAVING
+            Subqueries: Subconsultas
+            Set operations: Operaciones de conjuntos
+            Common table expressions: Expresiones de tabla común
+            Recursive queries: Consultas recursivas
+            "INSERT … SELECT": "INSERT … SELECT"
+            Raw SQL: SQL directo
+            Operations: Operación
+            Transactions: Transacciones
+            Dialects and portability: Dialectos y portabilidad
+            Migrations: Migraciones
+            Production builds: Compilaciones de producción
+            Reference: Referencia
+            Errors: Errores
+            Limitations: Limitaciones
+
 markdown_extensions:
   - admonition
   - attr_list
