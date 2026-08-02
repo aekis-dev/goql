@@ -195,17 +195,15 @@ func TestCount_AcrossRelationCountsRowsOnce(t *testing.T) {
 	defer cleanup()
 	seedData(t, ctx, e)
 
-	// Order 1 carries two tags, so the join yields it twice; counting must still say one.
+	// Order 1 carries two matching tags. A relation filter is an EXISTS, so it cannot
+	// yield the order twice and the count needs no DISTINCT.
 	type Tally struct{ N int64 }
 	rows, err := goql.Select[Tally](ctx, e, func(t *Tally, o *Order, from *goql.From) bool {
 		from.Model = o
 		t.N = goql.Count()
-		for _, tag := range o.Tags {
-			if goql.Condition(tag.Name, "IN", "urgent", "vip") {
-				return true
-			}
-		}
-		return false
+		return goql.Filter(o.Tags, func(tag *Tag) bool {
+			return goql.Condition(tag.Name, "IN", "urgent", "vip")
+		})
 	})
 	if err != nil {
 		t.Fatal(err)

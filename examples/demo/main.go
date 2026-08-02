@@ -116,14 +116,9 @@ func main() {
 	}
 	fmt.Printf("Found %d high-priority orders over 1000\n", len(highValue))
 
-	// --- Relation traversal: ranging over a relation becomes a JOIN.
+	// --- Relation traversal: a filter over a collection becomes a correlated EXISTS.
 	tagged, err := goql.Select[models.Order](ctx, e, func(o *models.Order) bool {
-		for _, t := range o.Tags {
-			if t.Name == "urgent" {
-				return true
-			}
-		}
-		return false
+		return goql.Filter(o.Tags, func(t *models.Tag) bool { return t.Name == "urgent" })
 	})
 	if err != nil {
 		log.Fatal("select tagged: ", err)
@@ -131,12 +126,7 @@ func main() {
 	fmt.Printf("Found %d orders tagged urgent\n", len(tagged))
 
 	bigSpenders, err := goql.Select[models.Customer](ctx, e, func(c *models.Customer) bool {
-		for _, o := range c.Orders {
-			if o.Total > 1000 {
-				return true
-			}
-		}
-		return false
+		return goql.Filter(c.Orders, func(o *models.Order) bool { return o.Total > 1000 })
 	})
 	if err != nil {
 		log.Fatal("select big spenders: ", err)
@@ -223,6 +213,30 @@ func main() {
 		log.Fatal("select invoices with a left join: ", err)
 	}
 	fmt.Printf("Open invoices, paid or not: %d\n", len(allInvoices))
+
+	// A join declared by relation path: the models say how each hop relates, so only the
+	// path and a handle for the far row are needed. LEFT keeps orders whose customer row
+	// is missing, which a path written in a predicate cannot express.
+	withCustomer, err := goql.Select[models.Order](ctx, e,
+		func(o *models.Order, c *models.Customer, j *goql.Join) bool {
+			j.Field = o.Customer
+			j.Model = c
+			j.Type = goql.Left
+			return c.Country == "USA"
+		})
+	if err != nil {
+		log.Fatal("select orders by path join: ", err)
+	}
+	fmt.Printf("Orders whose customer is in the USA: %d\n", len(withCustomer))
+
+	// A field path traverses any number of many2one hops.
+	deep, err := goql.Select[models.Category](ctx, e, func(c *models.Category) bool {
+		return c.Parent.Parent.Name == "Root"
+	})
+	if err != nil {
+		log.Fatal("select by deep path: ", err)
+	}
+	fmt.Printf("Categories two levels under Root: %d\n", len(deep))
 
 	// --- Subquery: a goql call written inside a lambda is parsed too, and compiles to a
 	// nested SELECT. Naming it makes it reusable; Unwrap nests one directly.

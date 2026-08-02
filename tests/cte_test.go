@@ -104,9 +104,11 @@ func TestCTE_RejectsOuterReference(t *testing.T) {
 	}
 }
 
-// A query selecting whole model rows has no named columns to read from.
-func TestCTE_RejectsUnprojectedQuery(t *testing.T) {
-	_, err := (&goql.DebugExecutor{}).ParseQueryFromSource(`func(s *Summary, t *CustomerTotal, from *goql.From) bool {
+// A query selecting whole model rows names no columns of its own, so the model's columns
+// are projected for it. That is what lets a plain filtered select be read from without
+// restating what it carries.
+func TestCTE_UnprojectedQueryIsAutoProjected(t *testing.T) {
+	body := parseSource(t, `func(s *Summary, t *CustomerTotal, from *goql.From) bool {
 		rows, _ := goql.Select[Order](ctx, e, func(o *Order) bool {
 			return o.Total > 0
 		})
@@ -114,10 +116,16 @@ func TestCTE_RejectsUnprojectedQuery(t *testing.T) {
 		from.Model = t
 		s.Average = goql.Avg(t.Total)
 		return true
-	}`, "Select")
-	if err == nil || !strings.Contains(err.Error(), "no named columns") {
-		t.Fatalf("expected an unprojected query to be refused, got: %v", err)
-	}
+	}`)
+
+	q, err := sqlite.LambdaSearch(body, nil)
+	assertNoError(t, err)
+	// The definition projects the model's own columns, primary key first.
+	assertContains(t, q.SQL, `WITH "rows" AS (SELECT o."id" AS "ID"`)
+	assertContains(t, q.SQL, `o."total_amount" AS "Total"`)
+	// And the outer query reads one of them through the row handle.
+	assertContains(t, q.SQL, `AVG(r."Total") AS "Average"`)
+	assertContains(t, q.SQL, `FROM "rows" r`)
 }
 
 // End to end: an aggregate over an aggregate.

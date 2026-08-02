@@ -29,17 +29,76 @@ type FieldRef struct {
 	// registered schema — its columns are whatever the defining query projected.
 	CTETable  string
 	CTEColumn string
+
+	// AliasPath is the path this reference is rooted at, set when it is reached through a
+	// handle an explicit join bound — j.Field = o.Customer.Country, j.Model = co makes co
+	// stand for the row at "Customer.Country" rather than for the table at large.
+	AliasPath string
 }
 
-// TableName returns the table name for this field reference
+// TableName returns the table the column this reference names actually lives on, which for
+// a path is the table at the far end of it.
 func (fr *FieldRef) TableName() string {
 	if fr.CTETable != "" {
 		return fr.CTETable
 	}
-	if fr.Nested != nil {
-		return fr.Nested.Field.TableSchema.TableName
+	return fr.Terminal().Field.TableSchema.TableName
+}
+
+// Terminal returns the last reference in a path — the one naming a column rather than a
+// relation to traverse.
+func (fr *FieldRef) Terminal() *FieldRef {
+	for fr.Nested != nil {
+		fr = fr.Nested
 	}
-	return fr.Field.TableSchema.TableName
+	return fr
+}
+
+// Path is the dotted relation path leading to this reference's column: "Customer.Company"
+// for o.Customer.Company.Name, empty for a column on the query's own table.
+//
+// Aliases are keyed by this rather than by table name, so two paths reaching the same table
+// are distinct — o.Customer.Country and o.Tag.Country are different countries, and keying by
+// table would render both under one alias and silently ask for one row to be two things.
+func (fr *FieldRef) Path() string {
+	if fr.CTETable != "" {
+		return ""
+	}
+	var parts []string
+	if fr.AliasPath != "" {
+		parts = append(parts, fr.AliasPath)
+	}
+	for fr.Nested != nil {
+		parts = append(parts, fr.Field.Name)
+		fr = fr.Nested
+	}
+	return strings.Join(parts, ".")
+}
+
+// FieldHop is one relation traversed by a path: the table it starts from, the relation
+// field, and the path identifying the table it arrives at.
+type FieldHop struct {
+	SourcePath string
+	Field      *models.Field
+	TargetPath string
+}
+
+// Hops returns one entry per relation this reference traverses, outermost first. A reference
+// to a column on the query's own table has none.
+func (fr *FieldRef) Hops() []FieldHop {
+	var hops []FieldHop
+	path := fr.AliasPath
+	for fr.Nested != nil {
+		source := path
+		if path == "" {
+			path = fr.Field.Name
+		} else {
+			path += "." + fr.Field.Name
+		}
+		hops = append(hops, FieldHop{SourcePath: source, Field: fr.Field, TargetPath: path})
+		fr = fr.Nested
+	}
+	return hops
 }
 
 // ValueRef represents the right-hand side of a comparison or assignment: a literal, a
@@ -107,6 +166,10 @@ type ParseNode struct {
 	// Agg replaces Left with an aggregate over a column — SUM(total) > 1000. A condition
 	// carrying one filters groups rather than rows, so it is emitted as HAVING.
 	Agg *ParseSelect
+
+	// Exists is a correlated EXISTS over a collection relation — goql.Filter(o.Tags, …).
+	// It stands alone as a condition, like Sub does for a nested Exists call.
+	Exists *RelationExists
 }
 
 // LogicalNot is the LogicalOp of a negation node, which has exactly one child.
@@ -446,4 +509,20 @@ func describeCombination(node *ParseNode) string {
 		return "it is negated"
 	}
 	return "it is combined with " + node.LogicalOp
+}
+
+// RelationExists is a correlated EXISTS over a collection relation, produced by
+// goql.Filter(o.Tags, func(t *Tag) bool { … }).
+//
+// It is a predicate, not a join: it answers "does a related row satisfying Condition
+// exist" for the row under consideration, and so cannot change the number of rows the
+// enclosing statement returns. That is what lets it sit inside ||, ! and a branch arm,
+// none of which a JOIN can do.
+type RelationExists struct {
+	// Relation is the collection field being tested (o.Tags, c.Orders).
+	Relation *FieldRef
+
+	// Condition is the predicate over the related model. Nil means "any related row",
+	// i.e. the relation is non-empty.
+	Condition *ParseNode
 }

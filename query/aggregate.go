@@ -75,9 +75,11 @@ func (d *Dialect) LambdaCount(q *ParseQuery) (*Query, error) {
 		return nil, err
 	}
 
-	// A comma-joined participant multiplies rows the same way a relation join does.
+	// A joined participant is of unknown cardinality and may multiply rows. Joins derived
+	// from the condition tree cannot: a relation predicate is an EXISTS, so what remains is
+	// many2one path traversal, which yields at most one row per source row.
 	counted := "COUNT(*)"
-	if (len(joins) > 0 || len(body.Joined) > 0) && schema.PrimaryKey != nil {
+	if len(body.Joined) > 0 && schema.PrimaryKey != nil {
 		counted = fmt.Sprintf("COUNT(DISTINCT %s.%s)", alias, d.primaryKey(schema))
 	}
 

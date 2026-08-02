@@ -153,7 +153,7 @@ func (s *stmt) marks(count int) string {
 
 // column renders a field reference qualified for this statement.
 func (s *stmt) column(ref *FieldRef) string {
-	return fmt.Sprintf("%s.%s", s.alias.Alias(ref.TableName()), s.d.columnName(ref))
+	return fmt.Sprintf("%s.%s", s.alias.AliasFor(ref.Path(), ref.TableName()), s.d.columnName(ref))
 }
 
 // columnName resolves the quoted column a field reference points at.
@@ -163,7 +163,7 @@ func (d *Dialect) columnName(ref *FieldRef) string {
 		return d.QuoteIdent(ref.CTEColumn)
 	}
 	if ref.Nested != nil {
-		return d.QuoteIdent(ref.Nested.Field.ColumnName())
+		return d.QuoteIdent(ref.Terminal().Field.ColumnName())
 	}
 	if ref.Field.RelationKind() == models.M2O {
 		return d.QuoteIdent(ref.Field.GetFKColumn())

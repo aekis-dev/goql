@@ -43,6 +43,16 @@ func emitParseNode(node *query.ParseNode, depth int) string {
 			ind)
 	}
 
+	// A relation filter is a correlated EXISTS over a collection.
+	if node.Exists != nil {
+		return fmt.Sprintf(
+			"&query.ParseNode{\n%sExists: &query.RelationExists{\n%sRelation: %s,\n%sCondition: %s,\n%s},\n%s}",
+			ind1,
+			indent(depth+2), emitFieldRef(node.Exists.Relation),
+			indent(depth+2), emitParseNode(node.Exists.Condition, depth+2),
+			ind1, ind)
+	}
+
 	// A nested query standing alone is an EXISTS term.
 	if node.IsSubOnly() {
 		return fmt.Sprintf("&query.ParseNode{\n%sSub: %s,\n%s}",
@@ -117,12 +127,32 @@ func emitFieldRef(ref *query.FieldRef) string {
 	tableName := ref.Field.TableSchema.TableName
 	fieldName := ref.Field.Name
 
+	aliasPath := ""
+	if ref.AliasPath != "" {
+		aliasPath = fmt.Sprintf(", AliasPath: %q", ref.AliasPath)
+	}
+
 	if ref.Nested != nil {
 		return fmt.Sprintf(
-			"&query.FieldRef{Field: goql.ResolveField(%q, %q), Nested: %s}",
-			tableName, fieldName, emitFieldRef(ref.Nested))
+			"&query.FieldRef{Field: goql.ResolveField(%q, %q)%s, Nested: %s}",
+			tableName, fieldName, aliasPath, emitFieldRef(ref.Nested))
 	}
-	return fmt.Sprintf("&query.FieldRef{Field: goql.ResolveField(%q, %q)}", tableName, fieldName)
+	return fmt.Sprintf("&query.FieldRef{Field: goql.ResolveField(%q, %q)%s}",
+		tableName, fieldName, aliasPath)
+}
+
+// emitHops writes the relation path a join was declared with. The fields are resolved from
+// the registry at init time, like every other schema reference in a generated body.
+func emitHops(hops []query.FieldHop) string {
+	if len(hops) == 0 {
+		return "nil"
+	}
+	parts := make([]string, len(hops))
+	for i, hop := range hops {
+		parts[i] = fmt.Sprintf("{SourcePath: %q, Field: goql.ResolveField(%q, %q), TargetPath: %q}",
+			hop.SourcePath, hop.Field.TableSchema.TableName, hop.Field.Name, hop.TargetPath)
+	}
+	return fmt.Sprintf("[]query.FieldHop{%s}", strings.Join(parts, ", "))
 }
 
 func emitValueRef(ref *query.ValueRef) string {
@@ -231,8 +261,9 @@ func emitOptions(opts *query.Options, depth int) string {
 	if len(opts.Joins) > 0 {
 		specs := make([]string, len(opts.Joins))
 		for i, join := range opts.Joins {
-			specs[i] = fmt.Sprintf("{Table: %q, Type: %q, CTE: %v, On: %s}",
-				join.Table, join.Type, join.CTE, emitParseNode(join.On, depth+2))
+			specs[i] = fmt.Sprintf("{Table: %q, Type: %q, CTE: %v, Path: %q, Hops: %s, On: %s}",
+				join.Table, join.Type, join.CTE, join.Path, emitHops(join.Hops),
+				emitParseNode(join.On, depth+2))
 		}
 		fields = append(fields, fmt.Sprintf("Joins: []query.JoinSpec{%s}", strings.Join(specs, ", ")))
 	}

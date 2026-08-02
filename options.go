@@ -195,6 +195,17 @@ type Join struct {
 	On    bool
 	Type  JoinType
 
+	// Field declares the join by naming a relation path instead of writing the condition:
+	//
+	//	j.Field = o.Customer.Country    // orders → customers → countries
+	//	j.Model = co                    // co stands for the row at the far end
+	//	j.Type  = goql.Left
+	//
+	// Every hop of the path becomes one JOIN, related by the foreign keys the models
+	// already declare. Unlike a path written in a predicate, this may name a collection,
+	// which is how row multiplication is asked for deliberately.
+	Field any
+
 	// Query joins a named query instead of a table — a CTE bound in this lambda, or the
 	// CTE being defined, which is what makes a recursive one recursive:
 	//

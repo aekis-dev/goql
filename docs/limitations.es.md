@@ -13,16 +13,16 @@ Escritas sin adornos a propósito. Si algo de aquí te afecta, es mejor saberlo 
 
 ## El lenguaje de consultas
 
-- **`!x` no se analiza.** La negación unaria de Go no tiene caso en el analizador. Niega con
-  `goql.Condition(x, "NOT IN", …)`, `"NOT LIKE"`, `"IS NOT NULL"` o `<>`.
 - **`c.Deleted == nil` se rechaza** — `nil` se lee como un identificador. Usa
   `goql.Condition(c.Deleted, "IS NULL")`.
 - **No hay funciones SQL.** `COALESCE`, `LOWER`, `ABS`, aritmética de fechas: ninguna tiene
   sintaxis. Usa [SQL directo](raw-sql.md).
 - **No hay funciones de ventana**, ni `DISTINCT` más allá del `COUNT(DISTINCT pk)` automático
-  cuando hay un join.
-- **Las rutas de campo se detienen en dos segmentos.** `o.Customer.Company.Name` no está
-  soportado.
+  cuando la consulta hace join con un participante de cardinalidad desconocida.
+- **`goql.Filter` no puede alcanzar una colección a través de otra relación** — su argumento
+  debe ser una colección declarada en el modelo consultado.
+- **`goql.Filter` no puede apuntar a una tabla que la consulta externa ya usa**, por la misma
+  razón de alias que las subconsultas.
 - **Una subconsulta no puede usar una tabla que la consulta externa ya usa.** Ambas se
   generarían con el mismo alias; los autojoins necesitan alias por aparición, que el mapa de
   alias no modela.

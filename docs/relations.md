@@ -101,16 +101,12 @@ Reaching through a many2one joins the target:
 func(o *Order) bool { return o.Customer.Country == "USA" }
 ```
 
-Ranging over a collection joins it — including the join table for many2many:
+A collection is tested with `goql.Filter`, which compiles to a correlated `EXISTS` —
+including through the join table for many2many:
 
 ```go
 func(o *Order) bool {
-    for _, t := range o.Tags {
-        if t.Name == "urgent" {
-            return true
-        }
-    }
-    return false
+    return goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
 }
 ```
 
@@ -118,17 +114,26 @@ Both directions work:
 
 ```go
 func(c *Customer) bool {
-    for _, o := range c.Orders {
-        if o.Total > 1000 {
-            return true
-        }
-    }
-    return false
+    return goql.Filter(c.Orders, func(o *Order) bool { return o.Total > 1000 })
 }
 ```
+
+Because it is a predicate and not a join, it never duplicates the rows it filters, and it
+composes with `||` and `!`. See [Predicates](predicates.md) for the reasoning.
 
 !!! note "Traversal is not preloading"
     A predicate that joins `customers` does **not** populate `o.Customer`. The join filters;
     preloading fills. Ask for both if you want both.
 
-Field paths are limited to two segments — `o.Customer.Company.Name` is not supported.
+A path may traverse any number of many2one hops — `o.Customer.Company.Country.Code` walks
+four tables and reads a column of the last. Each hop is an `INNER JOIN` derived from the
+relation the models declare.
+
+The Go type checker keeps a path to many2one on its own: a collection is a slice, so
+`o.Tags.Name` does not compile. That is what guarantees **a path can never multiply rows** —
+use [`goql.Filter`](predicates.md) to test a collection, or [`goql.Join`](joins.md) to join
+one deliberately.
+
+!!! warning "Each hop is an inner join"
+    A row whose foreign key is NULL is dropped, so a four-hop path narrows the result four
+    times over. Use [`goql.Join`](joins.md) with `Type: goql.Left` when that matters.

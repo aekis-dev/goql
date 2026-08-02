@@ -69,8 +69,9 @@ goql understands a defined subset of Go. Anything else is refused with
 | `&&` `\|\|` | `AND` `OR` |
 | `if` / `else if` / `else` | one statement per arm, mutually exclusive |
 | `switch` (tag and tagless) | the same |
-| `for _, t := range o.Tags` | a join on the relation |
+| `goql.Filter(o.Tags, …)` | a correlated `EXISTS` over the relation |
 | `o.Customer.Country` | a join, or the local FK if the path ends at the target's key |
+| `!x` | `NOT (…)` |
 | `goql.Condition(...)` | `LIKE`, `IN`, `IS NULL`, `NOT IN`, … |
 | `+ - * / %` | arithmetic, or `\|\|`/`CONCAT` for strings |
 | a nested `goql.Select` / `Exists` | a subquery |
@@ -78,8 +79,6 @@ goql understands a defined subset of Go. Anything else is refused with
 
 **Not supported:**
 
-- `!x` — Go's unary not has no parser case yet. Negate with `goql.Condition(x, "NOT IN", …)`
-  or `"NOT LIKE"`.
 - Calling your own functions, method calls, type assertions, `len()`, string formatting.
 - `c.Deleted == nil` — `nil` reads as an identifier, so use `goql.Condition(c.Deleted, "IS NULL")`.
 

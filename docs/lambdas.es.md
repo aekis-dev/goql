@@ -71,8 +71,9 @@ goql entiende un subconjunto definido de Go. Cualquier otra cosa se rechaza con
 | `&&` `\|\|` | `AND` `OR` |
 | `if` / `else if` / `else` | una sentencia por rama, mutuamente excluyentes |
 | `switch` (con y sin etiqueta) | igual |
-| `for _, t := range o.Tags` | un join sobre la relación |
+| `goql.Filter(o.Tags, …)` | un `EXISTS` correlacionado sobre la relación |
 | `o.Customer.Country` | un join, o la clave foránea local si la ruta termina en la clave del destino |
+| `!x` | `NOT (…)` |
 | `goql.Condition(...)` | `LIKE`, `IN`, `IS NULL`, `NOT IN`, … |
 | `+ - * / %` | aritmética, o `\|\|`/`CONCAT` para cadenas |
 | una llamada anidada `goql.Select` / `Exists` | una subconsulta |
@@ -80,8 +81,6 @@ goql entiende un subconjunto definido de Go. Cualquier otra cosa se rechaza con
 
 **No soportado:**
 
-- `!x` — la negación unaria de Go todavía no tiene caso en el analizador. Niega con
-  `goql.Condition(x, "NOT IN", …)` o `"NOT LIKE"`.
 - Llamar a funciones propias, llamadas a métodos, aserciones de tipo, `len()`, formateo de
   cadenas.
 - `c.Deleted == nil` — `nil` se lee como un identificador, así que usa

@@ -63,12 +63,7 @@ func TestSearchSQL_LambdaWithM2OJoin(t *testing.T) {
 func TestSearchSQL_LambdaWithO2MJoin(t *testing.T) {
 	executor := &goql.DebugExecutor{}
 	body, err := executor.ParseQueryFromSource(`func(c *Customer) bool {
-		for _, o := range c.Orders {
-			if o.Total > 1000 {
-				return true
-			}
-		}
-		return false
+		return goql.Filter(c.Orders, func(o *Order) bool { return o.Total > 1000 })
 	}`, "Select")
 	if err != nil {
 		t.Fatal(err)
@@ -79,19 +74,14 @@ func TestSearchSQL_LambdaWithO2MJoin(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertEqual(t, `SELECT c.* FROM "customers" c INNER JOIN "orders" o ON o."customer_id" = c."id" WHERE o."total_amount" > ?`, q.SQL)
+	assertEqual(t, `SELECT c.* FROM "customers" c WHERE EXISTS (SELECT 1 FROM "orders" o WHERE o."customer_id" = c."id" AND (o."total_amount" > ?))`, q.SQL)
 	assertEqual(t, []any{int64(1000)}, q.Args)
 }
 
 func TestSearchSQL_LambdaWithM2MJoin(t *testing.T) {
 	executor := &goql.DebugExecutor{}
 	body, err := executor.ParseQueryFromSource(`func(o *Order) bool {
-		for _, t := range o.Tags {
-			if t.Name == "urgent" {
-				return true
-			}
-		}
-		return false
+		return goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
 	}`, "Select")
 	if err != nil {
 		t.Fatal(err)
@@ -103,21 +93,18 @@ func TestSearchSQL_LambdaWithM2MJoin(t *testing.T) {
 	}
 
 	// order_tags collides with orders on the preferred alias "o", so it becomes "o2".
-	assertEqual(t, `SELECT o.* FROM "orders" o INNER JOIN "order_tags" o2 ON o2."order_id" = o."id" INNER JOIN "tags" t ON t."id" = o2."tag_id" WHERE t."name" = ?`, q.SQL)
+	assertEqual(t, `SELECT o.* FROM "orders" o WHERE EXISTS (SELECT 1 FROM "order_tags" o2 INNER JOIN "tags" t ON t."id" = o2."tag_id" WHERE o2."order_id" = o."id" AND (t."name" = ?))`, q.SQL)
 	assertEqual(t, []any{"urgent"}, q.Args)
 }
 
-func TestSearchSQL_LambdaSentinel(t *testing.T) {
+// A relation filter composes with a plain column condition. This shape used to need a
+// sentinel variable assigned inside a range loop, because a loop is a statement and could
+// not appear inside the && it was contributing to.
+func TestSearchSQL_FilterComposesWithColumn(t *testing.T) {
 	executor := &goql.DebugExecutor{}
 	body, err := executor.ParseQueryFromSource(`func(o *Order) bool {
-		urgent_tag := false
-		for _, t := range o.Tags {
-			if t.Name == "urgent" {
-				urgent_tag = true
-				break
-			}
-		}
-		return o.Priority == "High" && urgent_tag == true
+		return o.Priority == "High" &&
+			goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
 	}`, "Select")
 	if err != nil {
 		t.Fatal(err)
@@ -128,9 +115,8 @@ func TestSearchSQL_LambdaSentinel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertContains(t, q.SQL, `INNER JOIN "order_tags" o2`)
-	assertContains(t, q.SQL, `INNER JOIN "tags" t`)
 	assertContains(t, q.SQL, `o."priority" = ?`)
+	assertContains(t, q.SQL, `EXISTS (SELECT 1 FROM "order_tags" o2`)
 	assertContains(t, q.SQL, `t."name" = ?`)
 }
 
@@ -199,12 +185,7 @@ func TestSearch_LambdaO2MJoin(t *testing.T) {
 	seedData(t, ctx, e)
 
 	results, err := goql.Select[Customer](ctx, e, func(c *Customer) bool {
-		for _, o := range c.Orders {
-			if o.Total > 1000 {
-				return true
-			}
-		}
-		return false
+		return goql.Filter(c.Orders, func(o *Order) bool { return o.Total > 1000 })
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -219,12 +200,7 @@ func TestSearch_LambdaM2MJoin(t *testing.T) {
 	seedData(t, ctx, e)
 
 	results, err := goql.Select[Order](ctx, e, func(o *Order) bool {
-		for _, t := range o.Tags {
-			if t.Name == "urgent" {
-				return true
-			}
-		}
-		return false
+		return goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
 	})
 	if err != nil {
 		t.Fatal(err)

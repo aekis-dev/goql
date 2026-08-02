@@ -34,7 +34,6 @@ type DebugExecutor struct {
 type parseContext struct {
 	schema    *models.Model
 	paramName string
-	sentinels map[string]*rangeSentinel
 
 	// destSchema and destParamName are set only for an Insert lambda, whose first parameter
 	// is the destination model and whose second is the source. Assignment targets resolve
@@ -51,6 +50,11 @@ type parseContext struct {
 	// joined lists the tables of the additional participants actually referenced, in
 	// declaration order, so the builder knows what to put in the FROM clause.
 	joined []string
+
+	// participantPaths maps a participant bound as the far row of a path join to that
+	// path, so references through it alias to that occurrence of the table rather than to
+	// the table at large.
+	participantPaths map[string]string
 
 	// correlated holds tables that belong to an enclosing lambda. A nested body may refer
 	// to them, but they must not enter its own FROM list — the outer statement has them.
@@ -92,6 +96,10 @@ type parseContext struct {
 
 	// cte is the common table expression this lambda reads from, once from.Query names one.
 	cte *query.ParseCTE
+
+	// ctes holds every definition bound in this lambda, whether read from or joined, in
+	// declaration order. A definition appears once however many carriers name it.
+	ctes []*query.ParseCTE
 
 	// cteRows maps a parameter standing for a row of a named query to that query's name and
 	// columns — the one from.Query reads from, and any joined with join.Query.
@@ -140,7 +148,6 @@ func newParseContext(schema *models.Model, paramName string) *parseContext {
 	pctx := &parseContext{
 		schema:       schema,
 		paramName:    paramName,
-		sentinels:    make(map[string]*rangeSentinel),
 		optionParams: make(map[string]string),
 		sortSpecs:    make(map[string]*query.SortSpec),
 		joinSpecs:    make(map[string]*query.JoinSpec),
@@ -355,11 +362,18 @@ func (pctx *parseContext) options() (*query.Options, error) {
 			// Declared and never used. Harmless on its own, but it reads as an intent that
 			// was not carried out, so say so rather than emitting a query without the join.
 			return nil, fmt.Errorf("%w: join parameter %s is declared but never assigned — "+
-				"set %s.Model and %s.On, or remove it", ErrInvalidOption, name, name, name)
+				"set %s.Field, or %s.Model and %s.On, or remove it",
+				ErrInvalidOption, name, name, name, name)
 		case spec.Table == "":
 			return nil, fmt.Errorf("%w: %s.Model is not set — a join needs the model it relates",
 				ErrInvalidOption, name)
-		case spec.On == nil:
+		case len(spec.Hops) > 0 && spec.Path != "" && !pctx.pathBound(spec.Path):
+			// A path supplies the condition, but the row it arrives at needs a handle or
+			// nothing can refer to it.
+			return nil, fmt.Errorf(
+				"%w: %s.Field joins %s but %s.Model is not set — the joined row needs a handle "+
+					"to be referenced by", ErrInvalidOption, name, spec.Table, name)
+		case len(spec.Hops) == 0 && spec.On == nil:
 			return nil, fmt.Errorf("%w: %s.On is not set — a join needs the condition relating "+
 				"%s, which goql will not guess", ErrInvalidOption, name, spec.Table)
 		}
@@ -553,11 +567,6 @@ func (e *DebugExecutor) optionStringSlice(expr ast.Expr) ([]string, error) {
 	return names, nil
 }
 
-type rangeSentinel struct {
-	relationRef *query.FieldRef
-	condition   *query.ParseNode
-}
-
 // extractValue extracts the actual value from an AST expression
 func (e *DebugExecutor) extractValue(expr ast.Expr, schema *models.Model, paramName string) (any, bool, error) {
 	switch v := expr.(type) {
@@ -748,6 +757,7 @@ func (e *DebugExecutor) parseLambda(fn any, call string) (*query.ParseQuery, err
 	}
 
 	parsed := &query.ParseQuery{Model: schema.Type.Name(), Func: recordedFunc(call), Body: body}
+	pctx.applyCTE(parsed)
 	if err := query.ValidateQuery(parsed, false); err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidLambda, err)
 	}
@@ -827,6 +837,7 @@ func (e *DebugExecutor) parseSource(source, call string) (*query.ParseQuery, err
 		return nil, err
 	}
 	parsed := &query.ParseQuery{Model: schema.Type.Name(), Func: recordedFunc(call), Body: body}
+	pctx.applyCTE(parsed)
 	if err := query.ValidateQuery(parsed, false); err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidLambda, err)
 	}
@@ -875,7 +886,6 @@ func (e *DebugExecutor) parseBody(funcLit *ast.FuncLit, pctx *parseContext) (*qu
 				continue
 			}
 
-			e.trackSentinelDecl(s, pctx)
 			assignment, relAssignment, err := e.tryParseAssignment(s, pctx)
 			if err != nil {
 				return nil, err
@@ -888,16 +898,7 @@ func (e *DebugExecutor) parseBody(funcLit *ast.FuncLit, pctx *parseContext) (*qu
 			}
 
 		case *ast.RangeStmt:
-			joinNode, err := e.parseRangeStmt(s, pctx)
-			if err != nil {
-				return nil, err
-			}
-			if joinNode != nil {
-				result.Branches = append(result.Branches, &query.ParseBranch{
-					Condition: joinNode,
-					Selects:   true,
-				})
-			}
+			return nil, rangeRetired(s)
 
 		case *ast.IfStmt:
 			branches, arms, err := e.parseIfChain(s, pctx)
@@ -1224,104 +1225,6 @@ func (e *DebugExecutor) tryParseAssignment(s *ast.AssignStmt, pctx *parseContext
 	}
 }
 
-// trackSentinelDecl records boolean variables initialized to false
-func (e *DebugExecutor) trackSentinelDecl(s *ast.AssignStmt, pctx *parseContext) {
-	if s.Tok != token.DEFINE {
-		return
-	}
-	if len(s.Lhs) != 1 || len(s.Rhs) != 1 {
-		return
-	}
-	ident, ok := s.Lhs[0].(*ast.Ident)
-	if !ok {
-		return
-	}
-	if e.isAlwaysFalse(s.Rhs[0]) {
-		// register as potential sentinel — condition filled in by parseRangeStmt
-		pctx.sentinels[ident.Name] = nil
-	}
-}
-
-// parseRangeStmt handles: for _, t := range o.Tags { if t.X == val { sentinel = true } }
-func (e *DebugExecutor) parseRangeStmt(rangeStmt *ast.RangeStmt, pctx *parseContext) (*query.ParseNode, error) {
-	iterVar := ""
-	if ident, ok := rangeStmt.Value.(*ast.Ident); ok {
-		iterVar = ident.Name
-	}
-	if iterVar == "" || iterVar == "_" {
-		return nil, nil
-	}
-
-	relationRef, err := e.resolveFieldRef(rangeStmt.X, pctx.schema, pctx.paramName)
-	if err != nil {
-		return nil, fmt.Errorf("range expression: %w", err)
-	}
-	if !relationRef.Field.IsRelation() {
-		return nil, fmt.Errorf("range expression must be a relation field, got %s", relationRef.Field.Name)
-	}
-
-	targetType := relationRef.Field.TargetModel()
-	tempTarget := reflect.New(targetType).Interface()
-	targetEntity, ok := tempTarget.(models.Entity)
-	if !ok {
-		return nil, fmt.Errorf("target type %v does not implement Entity interface", targetType)
-	}
-	targetSchema, err := models.GetModel(targetEntity)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get target models: %w", err)
-	}
-
-	innerCtx := newParseContext(targetSchema, iterVar)
-
-	for _, stmt := range expandAssignments(rangeStmt.Body.List) {
-		ifStmt, ok := stmt.(*ast.IfStmt)
-		if !ok {
-			continue
-		}
-
-		innerCondition, err := e.exprToCondition(ifStmt.Cond, innerCtx)
-		if err != nil {
-			return nil, fmt.Errorf("range body condition: %w", err)
-		}
-
-		joinNode := &query.ParseNode{
-			JoinField: relationRef,
-			JoinScope: innerCondition,
-		}
-
-		sentinelVar := e.findSentinelAssignment(ifStmt.Body)
-		if sentinelVar != "" {
-			pctx.sentinels[sentinelVar] = &rangeSentinel{
-				relationRef: relationRef,
-				condition:   joinNode,
-			}
-		} else if e.returnsTrue(ifStmt.Body) {
-			// direct return true — bubble join node up
-			return joinNode, nil
-		}
-	}
-
-	return nil, nil
-}
-
-// findSentinelAssignment finds "varName = true" inside a block, returns varName
-func (e *DebugExecutor) findSentinelAssignment(block *ast.BlockStmt) string {
-	for _, stmt := range expandAssignments(block.List) {
-		assignStmt, ok := stmt.(*ast.AssignStmt)
-		if !ok {
-			continue
-		}
-		if len(assignStmt.Lhs) == 1 && len(assignStmt.Rhs) == 1 {
-			if ident, ok := assignStmt.Lhs[0].(*ast.Ident); ok {
-				if e.isAlwaysTrue(assignStmt.Rhs[0]) {
-					return ident.Name
-				}
-			}
-		}
-	}
-	return ""
-}
-
 func (e *DebugExecutor) exprToCondition(expr ast.Expr, pctx *parseContext) (*query.ParseNode, error) {
 	switch v := expr.(type) {
 	case *ast.BinaryExpr:
@@ -1344,17 +1247,6 @@ func (e *DebugExecutor) exprToCondition(expr ast.Expr, pctx *parseContext) (*que
 				LogicalOp: op,
 				Children:  []*query.ParseNode{left, right},
 			}, nil
-		}
-
-		// Check if left side is a sentinel variable being compared to true/false
-		if ident, ok := v.X.(*ast.Ident); ok {
-			if sentinel, ok := pctx.sentinels[ident.Name]; ok && sentinel != nil {
-				// urgent_tag == true → use the sentinel condition directly
-				// urgent_tag == false → negate it (not supported yet, skip)
-				if e.isAlwaysTrue(v.Y) {
-					return sentinel.condition, nil
-				}
-			}
 		}
 
 		// An aggregate on the left filters groups: SUM(total) > 1000 becomes HAVING.
@@ -1403,10 +1295,6 @@ func (e *DebugExecutor) exprToCondition(expr ast.Expr, pctx *parseContext) (*que
 		}, nil
 
 	case *ast.Ident:
-		// sentinel variable substitution: urgent_tag → its registered join condition
-		if sentinel, ok := pctx.sentinels[v.Name]; ok && sentinel != nil {
-			return sentinel.condition, nil
-		}
 		// A name bound to a nested Exists earlier in the body.
 		if sub, found := pctx.subqueries[v.Name]; found {
 			if sub.Func != "Exists" {
@@ -1419,6 +1307,11 @@ func (e *DebugExecutor) exprToCondition(expr ast.Expr, pctx *parseContext) (*que
 		return nil, fmt.Errorf("unexpected identifier %s in condition", v.Name)
 
 	case *ast.CallExpr:
+		// A relation filter is a correlated EXISTS over a collection.
+		if node, handled, err := e.filterCall(v, pctx); handled {
+			return node, err
+		}
+
 		// A nested Exists is a condition in its own right: EXISTS (SELECT 1 …).
 		sub, err := e.subqueryFor(v, pctx)
 		if err != nil {
@@ -1437,6 +1330,17 @@ func (e *DebugExecutor) exprToCondition(expr ast.Expr, pctx *parseContext) (*que
 
 	case *ast.ParenExpr:
 		return e.exprToCondition(v.X, pctx)
+
+	case *ast.UnaryExpr:
+		if v.Op != token.NOT {
+			return nil, fmt.Errorf(
+				"%w: unary %s is not a condition", ErrUnsupportedExpr, v.Op)
+		}
+		inner, err := e.exprToCondition(v.X, pctx)
+		if err != nil {
+			return nil, err
+		}
+		return query.Negate(inner), nil
 
 	default:
 		return nil, fmt.Errorf("%w: condition of type %T", ErrUnsupportedExpr, expr)
@@ -1483,6 +1387,14 @@ func (e *DebugExecutor) resolveFieldRefIn(expr ast.Expr, pctx *parseContext) (*q
 	if err != nil {
 		return nil, err
 	}
+
+	// A handle bound to the far row of a path join carries that path, so its columns render
+	// under the join's alias rather than a fresh one for the same table.
+	if path, bound := pctx.participantPaths[paramName]; bound {
+		ref.AliasPath = path
+		return ref, nil
+	}
+
 	pctx.noteJoined(schema)
 	return ref, nil
 }
@@ -1503,48 +1415,67 @@ func (e *DebugExecutor) resolveFieldRef(expr ast.Expr, schema *models.Model, par
 		return &query.FieldRef{Field: field}, nil
 	}
 
-	// Relation field: o.Customer.Country → path = ["Customer", "Country"]
-	if len(path) == 2 {
-		relationField, exists := schema.Fields[path[0]]
+	// A path traverses one relation per segment: o.Customer.Company.Country.Code walks
+	// orders → customers → companies → countries and reads a column of the last.
+	//
+	// Depth is unbounded because the relations are declared on the models, so every hop is
+	// derived rather than invented. The Go type checker keeps this to many2one on its own: a
+	// collection is a slice, so o.Tags.Name does not compile — which is what guarantees a
+	// path can never multiply rows.
+	root := &query.FieldRef{}
+	ref := root
+	current := schema
+
+	for i, segment := range path[:len(path)-1] {
+		relationField, exists := current.Fields[segment]
 		if !exists {
-			return nil, fmt.Errorf("field %s not found in models %s", path[0], schema.TableName)
+			return nil, fmt.Errorf("field %s not found in models %s", segment, current.TableName)
 		}
 		if !relationField.IsRelation() {
-			return nil, fmt.Errorf("field %s is not a relation field", path[0])
+			return nil, fmt.Errorf(
+				"field %s is not a relation field, so %s cannot be reached through it",
+				segment, strings.Join(path[i+1:], "."))
 		}
 
-		// Get target models
-		targetType := relationField.TargetModel()
-		tempTarget := reflect.New(targetType).Interface()
-		targetEntity, ok := tempTarget.(models.Entity)
-		if !ok {
-			return nil, fmt.Errorf("target type %v does not implement Entity", targetType)
-		}
-		targetSchema, err := models.GetModel(targetEntity)
+		targetSchema, err := query.RelationTargetSchema(relationField)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get models for %v: %w", targetType, err)
+			return nil, err
 		}
 
-		nestedField, exists := targetSchema.Fields[path[1]]
-		if !exists {
-			return nil, fmt.Errorf("field %s not found in models %s", path[1], targetSchema.TableName)
-		}
-
-		// The primary key of a many2one target is the value the foreign key column already
-		// holds, so o.Customer.ID is customers.id only in spelling — it is orders.customer_id.
-		// Resolving it locally avoids a join that could only ever compare a column to itself,
-		// and it is what makes a foreign key comparable to a plain value.
-		if relationField.RelationKind() == models.M2O && nestedField.PrimaryKey {
-			return &query.FieldRef{Field: relationField}, nil
-		}
-
-		return &query.FieldRef{
-			Field:  relationField,
-			Nested: &query.FieldRef{Field: nestedField},
-		}, nil
+		ref.Field = relationField
+		ref.Nested = &query.FieldRef{}
+		ref, current = ref.Nested, targetSchema
 	}
 
-	return nil, fmt.Errorf("field path depth > 2 not supported: %v", path)
+	terminal := path[len(path)-1]
+	terminalField, exists := current.Fields[terminal]
+	if !exists {
+		return nil, fmt.Errorf("field %s not found in models %s", terminal, current.TableName)
+	}
+	ref.Field = terminalField
+
+	// The primary key of a many2one target is the value the foreign key column already holds,
+	// so o.Customer.ID is customers.id only in spelling — it is orders.customer_id. Collapsing
+	// it avoids a join that could only ever compare a column to itself, and it is what makes a
+	// foreign key comparable to a plain value.
+	if last := lastRelation(root); last != nil && terminalField.PrimaryKey &&
+		last.Field.RelationKind() == models.M2O {
+		last.Nested = nil
+	}
+
+	return root, nil
+}
+
+// lastRelation returns the reference holding the final relation of a path, or nil when the
+// path traverses none.
+func lastRelation(ref *query.FieldRef) *query.FieldRef {
+	if ref.Nested == nil {
+		return nil
+	}
+	for ref.Nested.Nested != nil {
+		ref = ref.Nested
+	}
+	return ref
 }
 
 // resolveValueRef resolves an AST expression to a ValueRef
@@ -2200,11 +2131,12 @@ func (pctx *parseContext) cteColumn(expr ast.Expr) (*query.FieldRef, bool, error
 // applyCTE records the common table expression this query reads from, if any. The definition
 // travels with the body, so it survives into the generated prod registry like everything else.
 func (pctx *parseContext) applyCTE(parsed *query.ParseQuery) {
-	if pctx.cte == nil {
-		return
+	if pctx.cte != nil {
+		parsed.From = pctx.cte.Name
 	}
-	parsed.From = pctx.cte.Name
-	parsed.Body.With = append(parsed.Body.With, pctx.cte)
+	// Every definition bound in this lambda is emitted, including ones only joined —
+	// otherwise the statement references a table that was never defined.
+	parsed.Body.With = append(parsed.Body.With, pctx.ctes...)
 }
 
 // outerParamNames collects the enclosing lambda's model parameter names.

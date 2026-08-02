@@ -198,18 +198,31 @@ func(o *Order, p Key) bool { return o.Customer.ID == p.ID }
 // → WHERE o."customer_id" = ?
 ```
 
-Iterar sobre un one2many o many2many también hace join:
+Un one2many o many2many se comprueba con `goql.Filter`, que pregunta si existe una fila
+relacionada que cumpla la condición:
 
 ```go
 func(o *Order) bool {
-    for _, t := range o.Tags {
-        if t.Name == "urgent" {
-            return true
-        }
-    }
-    return false
+    return goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
 }
-// → INNER JOIN "order_tags" … INNER JOIN "tags" t … WHERE t."name" = ?
+// → WHERE EXISTS (SELECT 1 FROM "order_tags" o2
+//                   INNER JOIN "tags" t ON t."id" = o2."tag_id"
+//                  WHERE o2."order_id" = o."id" AND (t."name" = ?))
 ```
+
+`EXISTS` y no un join porque un filtro es un **predicado**: responde una pregunta sobre la
+fila sin cambiar cuántas filas vuelven. Eso es lo que le permite aparecer dentro de `||`, `!`
+y una rama — cosas que un join no puede hacer, porque se aplica antes del `WHERE`:
+
+```go
+return o.Total > 200 ||
+    goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
+
+return !goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
+// → NOT EXISTS (…)
+```
+
+`Filter` es una función real, así que llamarla sobre una entidad ya cargada, fuera de una
+consulta, funciona como cabría esperar.
 
 Ver [Joins](joins.md) para modelos sin relación declarada entre ellos.

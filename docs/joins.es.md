@@ -96,11 +96,63 @@ Un join multiplica filas, así que `goql.Count()` pasa a ser `COUNT(DISTINCT pk)
 la consulta haga join — una fila que coincide por varias filas relacionadas se cuenta una vez.
 Esto vale igual para joins de relación, participantes de modelo y joins explícitos.
 
+## Declarar un join por ruta de relación
+
+Cuando los modelos ya declaran la relación, `j.Field` nombra la ruta en lugar de repetir la
+condición:
+
+```go
+goql.Select[Order](ctx, e, func(o *Order, c *Customer, j *goql.Join) bool {
+    j.Field = o.Customer      // la ruta — orders → customers
+    j.Model = c               // c representa la fila del otro extremo
+    j.Type  = goql.Left
+    return c.Country == "USA"
+})
+// → LEFT JOIN "customers" c ON o."customer_id" = c."id" WHERE c."country" = ?
+```
+
+La ruta puede tener varios saltos, y **cada salto toma el tipo declarado** — un `LEFT` seguido
+de un `INNER` descartaría justo las filas que el `LEFT` existía para conservar:
+
+```go
+j.Field = c.Parent.Parent    // categories → categories → categories
+j.Model = grandparent
+```
+
+`j.On`, si también se indica, se une con AND a la condición del **último** salto. En un join
+externo ese es el único sitio donde puede ir un filtro — moverlo al `WHERE` convierte el join
+de nuevo en interno en silencio:
+
+```go
+j.Field = o.Customer
+j.Model = c
+j.Type  = goql.Left
+j.On    = c.Status == "Active"
+// → LEFT JOIN "customers" c ON o."customer_id" = c."id" AND c."status" = ?
+```
+
+A diferencia de una ruta escrita en un predicado, `j.Field` **sí puede nombrar una colección**
+— así es como se pide la multiplicación de filas deliberadamente, en vez de que aparezca por
+sorpresa:
+
+```go
+j.Field = o.Tags     // une la tabla intermedia y las etiquetas; las filas se multiplican
+j.Model = tg
+```
+
+### Por qué un handle y no solo una ruta
+
+Una ruta en un predicado solo se puede *leer*. Vincular la fila del otro extremo a un handle es
+lo que permite ordenar por ella, proyectarla, conservarla con semántica `LEFT` o referirse a
+ella en varias condiciones sin repetir la ruta. Por eso un join por ruta sin `j.Model` se
+rechaza.
+
 ## Cuál usar
 
 | | |
 |---|---|
-| Los modelos tienen una relación | recórrela — no hay nada que declarar |
+| Los modelos tienen una relación y solo lees una columna | recórrela — `o.Customer.Country`, nada que declarar |
+| Los modelos tienen una relación y necesitas la fila, `LEFT`, u ordenar por ella | `goql.Join` con `Field` |
 | Sin relación, join interno, clave evidente | declara ambos modelos y compáralos |
 | Necesitas `LEFT`/`RIGHT`/`FULL`, o la condición no es una igualdad simple | `goql.Join` |
 | El otro lado es una consulta, no una tabla | `goql.Join` con `Query` — ver [CTE](cte.md) |

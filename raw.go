@@ -89,6 +89,31 @@ func (ctx *Engine) parsePredicate(fn any, call string) (*query.ParseQuery, error
 // value and drops the error, which is rarely what you want — handle the error instead.
 func Unwrap[T any](value T, _ error) T { return value }
 
+// Filter reports whether any element of a collection satisfies pred.
+//
+// Inside a lambda it is parsed, not executed, and compiles to a correlated EXISTS over the
+// relation:
+//
+//	goql.Select[Order](ctx, e, func(o *Order) bool {
+//	    return o.Total > 200 ||
+//	        goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
+//	})
+//
+// EXISTS rather than a JOIN because a filter is a *predicate*: it answers a question about
+// the row under consideration without changing how many rows come back, which is what lets it
+// appear inside ||, ! and a branch arm. Negate it with ! for NOT EXISTS.
+//
+// Unlike most of goql's lambda vocabulary this is a real function, so calling it on a loaded
+// entity outside a query returns the answer you would expect.
+func Filter[T any](collection []T, pred func(*T) bool) bool {
+	for i := range collection {
+		if pred(&collection[i]) {
+			return true
+		}
+	}
+	return false
+}
+
 // selectProjected runs a query whose result type is not a model, scanning each row into T by
 // matching column aliases to field names. Column order therefore never matters, and an
 // embedded model in T is filled like any other field.

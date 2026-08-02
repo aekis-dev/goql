@@ -55,6 +55,17 @@ type JoinSpec struct {
 	// CTE marks a join against a named query rather than a table. It changes nothing in the
 	// rendering — a CTE is referenced by name — but it is what identifies a recursive term.
 	CTE bool
+
+	// Hops is set when the join was declared by naming a relation path rather than writing
+	// an ON condition: j.Field = o.Customer.Country. Each hop renders as one JOIN, all of
+	// them with this join's Type — a LEFT followed by an INNER would drop exactly the rows
+	// the LEFT existed to keep. On, if also given, is ANDed into the last hop's condition,
+	// which for an outer join is the only place a filter can go.
+	Hops []FieldHop
+
+	// Path identifies the joined row for aliasing, so a handle bound with join.Model
+	// resolves against this occurrence rather than the table at large.
+	Path string
 }
 
 // JoinsTable reports whether an explicit join already brings this table into the statement,

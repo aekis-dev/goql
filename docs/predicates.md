@@ -195,18 +195,32 @@ func(o *Order, p Key) bool { return o.Customer.ID == p.ID }
 // → WHERE o."customer_id" = ?
 ```
 
-Ranging over a one2many or many2many joins as well:
+A one2many or many2many is tested with `goql.Filter`, which asks whether a matching related
+row exists:
 
 ```go
 func(o *Order) bool {
-    for _, t := range o.Tags {
-        if t.Name == "urgent" {
-            return true
-        }
-    }
-    return false
+    return goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
 }
-// → INNER JOIN "order_tags" … INNER JOIN "tags" t … WHERE t."name" = ?
+// → WHERE EXISTS (SELECT 1 FROM "order_tags" o2
+//                   INNER JOIN "tags" t ON t."id" = o2."tag_id"
+//                  WHERE o2."order_id" = o."id" AND (t."name" = ?))
 ```
+
+`EXISTS` rather than a join because a filter is a **predicate**: it answers a question about
+the row without changing how many rows come back. That is what lets it appear inside `||`,
+`!` and a branch arm — none of which a join can do, since a join is applied before the
+`WHERE`:
+
+```go
+return o.Total > 200 ||
+    goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
+
+return !goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
+// → NOT EXISTS (…)
+```
+
+`Filter` is a real function, so calling it on a loaded entity outside a query works as you
+would expect.
 
 See [Joins](joins.md) for models with no declared relation between them.

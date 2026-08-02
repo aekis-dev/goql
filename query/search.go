@@ -283,13 +283,12 @@ func (d *Dialect) groupTerms(body *ParseBody, schema *models.Model, alias string
 // projectionList renders an explicit projection, aliasing every column to the result field
 // it lands in.
 func (d *Dialect) projectionList(body *ParseBody, schema *models.Model, alias string, s *stmt) (string, []any, error) {
-	// A join multiplies rows, so counting them would count one entity several times. This is
-	// the same rule the dedicated Count builder applied before projections existed.
+	// A joined participant is of unknown cardinality, so counting rows could count one
+	// entity several times. Joins derived from the condition tree cannot multiply rows: a
+	// relation predicate is an EXISTS, leaving only many2one path traversal.
 	distinct := ""
-	if joins := CollectJoins(orEmpty(body.SelectCondition()), map[string]bool{}); len(joins) > 0 || len(body.Joined) > 0 {
-		if schema.PrimaryKey != nil {
-			distinct = fmt.Sprintf("DISTINCT %s.%s", alias, d.primaryKey(schema))
-		}
+	if len(body.Joined) > 0 && schema.PrimaryKey != nil {
+		distinct = fmt.Sprintf("DISTINCT %s.%s", alias, d.primaryKey(schema))
 	}
 
 	cols := make([]string, 0, len(body.Select))

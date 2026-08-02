@@ -82,12 +82,7 @@ func TestCreate_WithM2MTags(t *testing.T) {
 
 	// Verify tags were associated
 	tagged, err := goql.Select[Order](ctx, e, func(o *Order) bool {
-		for _, t := range o.Tags {
-			if t.Name == "urgent" {
-				return true
-			}
-		}
-		return false
+		return goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
 	})
 	if err != nil {
 		t.Fatal(err)

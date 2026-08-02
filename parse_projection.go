@@ -75,33 +75,14 @@ func (e *DebugExecutor) setFromModel(field string, rhs ast.Expr, pctx *parseCont
 }
 
 // setFromQuery handles `from.Query = totals`, which reads from a query bound earlier in the
-// body instead of from a table. The CTE takes the Go variable's name, so the name is stated
-// once and cannot drift.
+// body instead of from a table. The definition is resolved by bindQueryRef, shared with
+// join.Query so the two cannot diverge.
 func (e *DebugExecutor) setFromQuery(rhs ast.Expr, pctx *parseContext) error {
-	name := baseIdentName(rhs)
-	sub, bound := pctx.subqueries[name]
-	if !bound {
-		return fmt.Errorf(
-			"%w: from.Query must name a query bound in this lambda (x, _ := goql.Select[…]), got %s",
-			ErrInvalidLambda, types.ExprString(rhs))
+	cte, err := e.bindQueryRef(rhs, "from", pctx)
+	if err != nil {
+		return err
 	}
-	if sub.Func != "" {
-		return fmt.Errorf("%w: %s is a nested %s, which yields a value rather than rows to read from",
-			ErrInvalidLambda, name, displayFunc(sub.Func))
-	}
-	if len(sub.Body.Select) == 0 && sub.Body.Set == nil {
-		return fmt.Errorf(
-			"%w: %s selects whole %s rows, so it has no named columns to read — project the "+
-				"columns the outer query needs", ErrInvalidLambda, name, sub.Model)
-	}
-	columns := projectedColumns(sub.Body)
-
-	// A self-reference carries a placeholder until now: the Go binding is what names the CTE,
-	// and that name is only known here. Finding one is also what makes the query recursive.
-	recursive := nameSelfReferences(sub, name)
-
-	pctx.cte = &query.ParseCTE{Name: name, Columns: columns, Query: sub, Recursive: recursive}
-	delete(pctx.subqueries, name)
+	pctx.cte = cte
 	return nil
 }
 

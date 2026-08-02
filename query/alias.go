@@ -35,7 +35,20 @@ func NewAliasMap(d *Dialect) *AliasMap {
 // letter is preferred, with a numeric suffix to break collisions (customers → c,
 // carts → c2), which also keeps future self-joins unambiguous.
 func (am *AliasMap) Alias(table string) string {
-	if existing, ok := am.byTable[table]; ok {
+	return am.AliasFor("", table)
+}
+
+// AliasFor returns the alias for a table reached by a relation path, assigning one on first
+// use. The path is what identifies the occurrence: two paths reaching the same table are two
+// different rows and must not share an alias. An empty path is the table itself — the query's
+// own, a participant, or a CTE.
+func (am *AliasMap) AliasFor(path, table string) string {
+	key := table
+	if path != "" {
+		key = table + "\x00" + path
+	}
+
+	if existing, ok := am.byTable[key]; ok {
 		return existing
 	}
 
@@ -52,7 +65,7 @@ func (am *AliasMap) Alias(table string) string {
 		candidate = fmt.Sprintf("%s%d", base, n)
 	}
 
-	am.byTable[table] = candidate
+	am.byTable[key] = candidate
 	am.used[candidate] = true
 	return candidate
 }
@@ -72,7 +85,12 @@ func (am *AliasMap) PinTableName(table string) {
 // From renders a table reference for a FROM or JOIN clause: `"customers" c`, or just
 // `"customers"` when the table has been pinned.
 func (am *AliasMap) From(table string) string {
-	alias := am.Alias(table)
+	return am.FromFor("", table)
+}
+
+// FromFor renders a table reference for a table reached by a relation path.
+func (am *AliasMap) FromFor(path, table string) string {
+	alias := am.AliasFor(path, table)
 	quoted := am.d.QuoteIdent(table)
 	if alias == quoted {
 		return quoted

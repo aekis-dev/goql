@@ -12,15 +12,16 @@ Kept blunt on purpose. If something here matters to you, it is better to know no
 
 ## The query language
 
-- **`!x` is not parsed.** Go's unary not has no parser case. Negate with
-  `goql.Condition(x, "NOT IN", …)`, `"NOT LIKE"`, `"IS NOT NULL"` or `<>`.
 - **`c.Deleted == nil` is refused** — `nil` reads as an identifier. Use
   `goql.Condition(c.Deleted, "IS NULL")`.
 - **No SQL functions.** `COALESCE`, `LOWER`, `ABS`, date arithmetic — none have a spelling.
   Use [raw SQL](raw-sql.md).
-- **No window functions**, and no `DISTINCT` beyond the automatic `COUNT(DISTINCT pk)` over a
-  join.
-- **Field paths stop at two segments.** `o.Customer.Company.Name` is not supported.
+- **No window functions**, and no `DISTINCT` beyond the automatic `COUNT(DISTINCT pk)` when a
+  query joins a participant of unknown cardinality.
+- **`goql.Filter` cannot reach a collection through another relation** — its argument must be
+  a collection declared on the model being queried.
+- **`goql.Filter` cannot target a table the enclosing query already uses**, for the same
+  aliasing reason subqueries cannot.
 - **A subquery cannot use a table the enclosing query already uses.** Both would render with
   the same alias; self-joins need per-occurrence aliases, which the alias map does not model.
 - **Concatenating two params values reads as arithmetic**, because a params placeholder

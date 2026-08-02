@@ -103,16 +103,12 @@ Alcanzar un many2one hace join con el destino:
 func(o *Order) bool { return o.Customer.Country == "USA" }
 ```
 
-Iterar sobre una colección hace join — incluida la tabla intermedia en many2many:
+Una colección se comprueba con `goql.Filter`, que compila a un `EXISTS` correlacionado —
+incluida la tabla intermedia en many2many:
 
 ```go
 func(o *Order) bool {
-    for _, t := range o.Tags {
-        if t.Name == "urgent" {
-            return true
-        }
-    }
-    return false
+    return goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
 }
 ```
 
@@ -120,18 +116,27 @@ Funciona en ambas direcciones:
 
 ```go
 func(c *Customer) bool {
-    for _, o := range c.Orders {
-        if o.Total > 1000 {
-            return true
-        }
-    }
-    return false
+    return goql.Filter(c.Orders, func(o *Order) bool { return o.Total > 1000 })
 }
 ```
+
+Al ser un predicado y no un join, nunca duplica las filas que filtra, y compone con `||` y
+`!`. Ver [Predicados](predicates.md) para el razonamiento.
 
 !!! note "Recorrer no es precargar"
     Un predicado que hace join con `customers` **no** rellena `o.Customer`. El join filtra;
     la precarga rellena. Pide las dos cosas si quieres las dos.
 
-Las rutas de campo están limitadas a dos segmentos: `o.Customer.Company.Name` no está
-soportado.
+Una ruta puede recorrer cualquier número de saltos many2one — `o.Customer.Company.Country.Code`
+atraviesa cuatro tablas y lee una columna de la última. Cada salto es un `INNER JOIN` derivado
+de la relación que declaran los modelos.
+
+El verificador de tipos de Go mantiene la ruta en many2one por sí solo: una colección es un
+slice, así que `o.Tags.Name` no compila. Eso es lo que garantiza que **una ruta nunca puede
+multiplicar filas** — usa [`goql.Filter`](predicates.md) para comprobar una colección, o
+[`goql.Join`](joins.md) para unirla deliberadamente.
+
+!!! warning "Cada salto es un inner join"
+    Una fila cuya clave foránea sea NULL se descarta, así que una ruta de cuatro saltos reduce
+    el resultado cuatro veces. Usa [`goql.Join`](joins.md) con `Type: goql.Left` cuando eso
+    importe.

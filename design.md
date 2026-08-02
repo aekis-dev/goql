@@ -1803,3 +1803,255 @@ structure: `index.md` is English, `index.es.md` its Spanish sibling.
   *and every `#anchor`* resolves in the built HTML for both languages — accented Spanish
   headings slugify to unaccented ids (`## Terminación` → `#terminacion`), which is exactly the
   kind of thing `--strict` does not catch.
+
+---
+
+## 23. Relation predicates are EXISTS, not joins (implemented 2026-08-01)
+
+**264 tests passing, dev and prod clean, dev/prod demo output byte-identical.**
+
+Found while reviewing ent, GORM and PonyORM for feature gaps (see `triage.md`). PonyORM adds
+`DISTINCT` automatically wherever a join could duplicate rows; goql applied that rule to
+`COUNT` only. Chasing that turned up a worse defect underneath, and the fix is not `DISTINCT`.
+
+### The cause: one construct meaning two different things
+
+`for _, t := range o.Tags { if t.Name == "urgent" { return true } }` **means** "there exists a
+matching tag" — read as ordinary Go, it is a semi-join. It **compiled to** an `INNER JOIN`.
+Everything below follows from that single divergence.
+
+- **Duplicate rows.** An entity matching two related rows came back twice.
+- **Rows silently dropped under `||`** — worse, and *not* fixable with `DISTINCT`. A join is a
+  clause on the statement, applied before the `WHERE`, so an entity with **no** related rows
+  was eliminated before the disjunction was evaluated. With orders (1500, tagged), (700,
+  tagged), (9000, **untagged**) and the predicate "total > 200 **or** tagged urgent", the
+  9000 order was absent from the result.
+- **Not expressible in `Update` at all.** An assignment nested inside a `range` was never
+  collected as a branch assignment: `write function at argument 0 assigns nothing`.
+
+### Decision — `goql.Filter`, compiling to a correlated `EXISTS`
+
+```go
+func Filter[T any](collection []T, pred func(*T) bool) bool
+```
+
+```go
+return o.Total > 200 ||
+    goql.Filter(o.Tags, func(t *Tag) bool { return t.Name == "urgent" })
+```
+```sql
+WHERE o."total_amount" > ?
+   OR EXISTS (SELECT 1 FROM "order_tags" o2
+                INNER JOIN "tags" t ON t."id" = o2."tag_id"
+               WHERE o2."order_id" = o."id" AND (t."name" = ?))
+```
+
+- **Rationale**: `EXISTS` is a *predicate*; a `JOIN` is a *clause*. Only the former can sit
+  inside `&&`, `||`, `!` or a branch arm — which is the whole of the three defects in one
+  sentence. Cardinality is preserved by construction, so there is no `DISTINCT` and no opt-out
+  option to design.
+- **The Go type checker enforces the domain for free**: `Filter` takes `[]T`, so it cannot be
+  applied to a many2one, and `o.Tags.Name` never compiled in the first place.
+- **`Filter` is a real function.** It returns whether any element satisfies the predicate, so
+  the same expression works on a loaded entity outside a query. Unlike the rest of goql's
+  lambda vocabulary, calling it directly is correct rather than meaningless.
+- **Alternatives considered**: `DISTINCT` on entity selects (rejected — fixes only the first
+  defect, leaves the other two); `IN (SELECT …)` (rejected — `NOT IN` is never true when the
+  subquery yields a NULL, a silent-empty-result trap `NOT EXISTS` does not have);
+  `LEFT JOIN … WHERE pk IS NOT NULL` (a semi-join written the long way, still changes
+  cardinality); keeping `for range` but compiling it to `EXISTS` (rejected — a statement can
+  only appear where statements can, so it could never reach an `if` condition, and it would
+  leave two spellings for one concept); naming it `Any` or `Has` (rejected by the user —
+  `Filter` reads as "`Select`, applied to a collection", which is the intended mental model).
+
+### `for range` over a relation is removed, not re-pointed
+
+The shape is still recognised, solely to produce an error naming the replacement (§22's
+"errors carry the solution"). The `rangeSentinel` machinery it required — a boolean variable
+assigned inside the loop and tested afterwards, which existed only because a loop cannot
+appear inside the `&&` it contributes to — is deleted. **The change is a net removal of code.**
+
+### `!x` now parses
+
+`exprToCondition` gained an `*ast.UnaryExpr` case for `token.NOT`, wrapping the operand in the
+existing `query.Negate`. This closes the follow-up §9 F2 identified (§4 A4 had wrongly claimed
+it), and it is what gives `NOT EXISTS` its spelling.
+
+### The `COUNT(DISTINCT pk)` rule narrows
+
+A condition tree can no longer contain a fan-out join: a relation predicate is an `EXISTS`, so
+what remains is many2one path traversal, which yields at most one row per source row.
+`DISTINCT` is therefore emitted only when `body.Joined` is non-empty — comma-joined
+participants and explicit joins, whose cardinality is unknown.
+
+### `UPDATE` loses its `FROM` clause for this shape
+
+A relation-conditioned `UPDATE` is now `UPDATE … WHERE EXISTS (…)` on every engine, which
+removes one of the two statement-shaped dialect divergences §8 E1 records (MySQL has no
+`UPDATE … FROM` and needs `UPDATE … JOIN … SET`). `DELETE` likewise loses its
+`IN (SELECT pk …)` wrapper. The many2one path case still uses `UPDATE … FROM`.
+
+### Bug found by a test written to check the SQL
+
+The first cut joined the correlation to the predicate with a bare `AND`:
+
+```sql
+WHERE o2."order_id" = o."id" AND (t."name" = ?) OR (t."name" = ?)
+```
+
+`AND` binds tighter than `OR`, so that parses as `(correlation AND urgent) OR (vip)` — the
+second disjunct is **uncorrelated**, making the `EXISTS` true for every row. A predicate that
+was itself a disjunction therefore matched everything. The predicate is now parenthesised.
+Caught by `TestFilter_NoDuplicateRows`, which returned 2 rows instead of 1.
+
+### Implementation notes
+
+- `query.RelationExists{Relation, Condition}` on `ParseNode.Exists`; negation reuses
+  `query.Negate`, so there is no `Negate` field.
+- Parsing reuses `parseSubBody`, so the enclosing participants are inherited as **correlated**
+  — the outer model may be referenced inside and does not enter the subquery's FROM list.
+- Rendering is two shapes (`query/exists.go`): a one2many correlates on the related row's
+  foreign key; a many2many correlates on the bridge table and joins the target to it. A
+  many2one traversal *inside* the predicate joins within the subquery, before its `WHERE`.
+- Correlation in `UPDATE`/`DELETE` needed nothing new: Phase A's `PinTableName` already
+  renders the target table as its own quoted name, so it reads `"orders"."id"` there and
+  `o."id"` in a `SELECT`.
+- **Prod**: the inner lambda is parsed as part of the parent body, like a subquery lambda, so
+  it never needs a registry key; §12's top-level-literal counting already prevents a nested
+  closure from shifting sibling numbering. `emitParseNode` gained an `Exists` case, verified
+  by the generated registry reconstructing `query.RelationExists`.
+
+### Known limits
+- A `Filter` over a table the enclosing query already uses is refused, for the same aliasing
+  reason §13 refuses such a subquery. This is what per-occurrence aliases would fix.
+- `Filter`'s argument must be a collection declared on the model being queried; reaching one
+  through another relation is refused.
+
+---
+
+## 24. Bound queries, deep paths and path joins (implemented 2026-08-01)
+
+**289 tests passing, dev and prod clean, dev/prod demo output byte-identical.**
+
+Three related changes, all about how a query reaches a second table. §23 fixed the *predicate*
+case; this fixes the *join* cases. Found by asking whether `goql.From` and `goql.Join`
+duplicate each other — they do, but in their implementations, not their types.
+
+### 24a — one resolver for a bound query, and a live bug
+
+- **The defect**: `from.Query` built a `ParseCTE` and registered it, so a `WITH` clause was
+  emitted. `join.Query` resolved the name and **registered nothing**, so the statement
+  referenced a table that was never defined — `no such table: totals` at the database.
+- **It had a second half**: `applyCTE` was only called from the *projection* parse path, so a
+  plain predicate lambda — where a joined query normally sits — had no CTE registration at
+  all. The join path could not have worked even with the definition built.
+- **Why it was never seen**: the only shipped use of `join.Query` is §21's recursive
+  self-reference, which takes a special-cased branch, and there the definition comes from the
+  *outer* lambda's `from.Query`. The general path had never run.
+- **Decision**: one `bindQueryRef` ([parse_boundquery.go](parse_boundquery.go)) that both
+  carriers call, so they cannot drift again. It owns: bound-here, value-yielding call refused,
+  projection requirement, self-reference naming, and registering the definition.
+- Two smaller divergences fixed with it: a set-bodied query could be read from but not joined
+  (the join path checked `Select` and not `Set`), and joining a nested `Exists` was rejected
+  by the wrong check, reporting "has no named columns to join — project the columns it needs"
+  instead of naming the real problem.
+- **`delete(pctx.subqueries, name)` was load-bearing, differently in each path.** Adopting
+  `from.Query`'s behaviour broke `joinColumns`, which read the columns back out of that map.
+  It now consults the registered definition, which already carries them.
+
+### 24b — auto-projection
+
+- **Decision**: a bound query with no explicit projection projects its model's own columns,
+  in the DDL's stable order.
+- **Rationale**: a CTE's columns *are* its defining query's projection, so a plain
+  `goql.Select[Tag](…)` previously could not be read from at all — `from.Query` refused it
+  with "selects whole Tag rows". That rejected the natural spelling, which is the one that
+  motivated the feature.
+- **Alternatives considered**: requiring `goql.Fields` (rejected — pushes ceremony onto the
+  common case); inlining a plain filter into the joined `ON` instead (rejected, see below).
+
+### 24c — `j.Query` is always a `WITH`, decided by elimination
+
+The open question was whether a plain filtered bound query should inline into the join's `ON`
+rather than become a CTE. **It should not, and the reasoning removed the choice rather than
+settling it:**
+
+- For an **inner** join, filtering in the `ON` and filtering in the `WHERE` are equivalent, so
+  `j.Query` with a plain filter buys nothing the predicate does not already do.
+- For an **outer** join they differ — but `j.Field` + `j.On` already covers that, and `On` is
+  strictly more expressive, because it can reference both sides while a bound query can only
+  reference its own model.
+- What is left for `j.Query` is only what *cannot* inline: grouped, aggregated, limited,
+  sorted or union-bodied. Those must be a `WITH`.
+
+So `from.Query` and `join.Query` render identically, which is what makes one resolver correct
+rather than merely convenient.
+
+### 24d — field paths of unlimited depth
+
+- **Decision**: a predicate path may traverse any number of many2one hops.
+  `o.Customer.Company.Country.Code` emits three joins.
+- **Rationale**: the relations are declared on the models, so every hop is *derived*, not
+  invented. The two-segment limit was an implementation artefact.
+- **The domain is enforced by the Go compiler at no cost**: `o.Tags` is `[]Tag`, so
+  `o.Tags.Name` does not compile. A path can therefore only traverse many2one, which means
+  **a path can never multiply rows** — a rule that holds with no parser check.
+- §17's foreign-key collapse still applies at the end of a path, so `c.Parent.Parent.ID`
+  joins once and reads the parent's own `parent_id`.
+- **Known consequence, documented**: each hop is an inner join, so a path of *n* hops narrows
+  the result *n* times where foreign keys are NULL. `goql.Join` with `Type: Left` is the
+  answer.
+
+### 24e — path-keyed aliases
+
+- **The blocker 24d would have sprung**: `AliasMap` keyed by table name, so
+  `o.Customer.Country.Code == "US" && o.Tag.Country.Code == "DE"` gave both paths the alias
+  `c` and asked for one row to be two different countries. Nearly unreachable at one hop;
+  ordinary at two.
+- **Decision**: key aliases by **path**, falling back to the table name at the root.
+  `CollectJoins` keys by path too — it previously keyed by terminal *field name*, so
+  `o.Customer.Company` and `o.Tag.Company` would have collapsed into one join.
+- **This is what unlocks self-joins**: `c.Parent.Parent.Name` renders three aliases over one
+  table, which §13 recorded as unsupported for exactly this reason.
+- **Scoped narrowly**: only join rendering and column qualification are path-aware. Root
+  tables, participants, CTEs and set branches still call `Alias(table)`, so the change did not
+  touch every builder. `TestPath_SingleHopUnchanged` pins the old string exactly, and no
+  existing dialect assertion changed.
+
+### Bug found while implementing 24e: joins were collected from the left side only
+
+`CollectJoins` looked at `node.Left` and nothing else, so a path on the **right** of a
+comparison was never joined. Harmless at one hop (the alias happened to exist); a reference to
+an alias no `FROM` clause introduced at two. It now collects from both sides, from `IN` value
+lists, and from inside arithmetic expressions.
+
+### 24f — `j.Field`, a join declared by relation path
+
+```go
+func(o *Order, c *Customer, j *goql.Join) bool {
+    j.Field = o.Customer.Country   // the path supplies the ON, for every hop
+    j.Model = co                   // co is a handle usable anywhere
+    j.Type  = goql.Left
+    return co.Region == "EMEA"
+}
+```
+
+- **Rationale**: a path in a predicate can only be *read*. A handle is what lets the far row
+  be sorted by, projected, kept with `LEFT` semantics, or referenced in several conditions
+  without repeating the path. A path join with no `j.Model` is refused for that reason.
+- **`Type` applies to every hop**, threaded into `joinClauseOf` rather than patched into the
+  rendered string — a many2many hop emits two `JOIN`s and both must take the kind.
+- **`On` is ANDed into the last hop**, which for an outer join is the only place a filter can
+  go without turning it back into an inner one.
+- **`Field` may name a collection**, unlike a predicate path — that is how fan-out is
+  requested deliberately.
+- **The handle carries the path**: `FieldRef.AliasPath` is set for references rooted at a
+  bound handle, so `co.Region` renders under the join's alias rather than a fresh one for the
+  same table. The joined table also leaves the FROM list, which `JoinsTable` already handled.
+- **Prod**: `JoinSpec.Hops` and `FieldRef.AliasPath` are emitted structurally; the generated
+  registry was verified to contain
+  `Path: "Customer", Hops: []query.FieldHop{{… ResolveField("orders", "Customer") …}}`.
+
+### Tests
+`tests/boundquery_test.go` (5), `tests/path_test.go` (8), `tests/joinfield_test.go` (12).
+The demo gained a path join and a two-hop path so the dev/prod comparison covers both.
