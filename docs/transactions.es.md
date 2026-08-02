@@ -34,6 +34,23 @@ e.Transaction(func(tx *goql.Engine) error {
 })
 ```
 
+## Un panic hace rollback
+
+El rollback está diferido, así que un panic dentro de la función atraviesa `Transaction` de
+camino hacia arriba, después de que la transacción se haya revertido y su conexión haya
+vuelto al pool. Sin eso, un único handler que entra en panic retiraría una conexión del pool
+durante toda la vida del proceso.
+
+```go
+e.Transaction(func(tx *goql.Engine) error {
+    goql.Create(ctx, tx, …)
+    panic("boom")          // rollback, conexión liberada, el panic sigue propagándose
+})
+```
+
+goql no recupera el panic: recuperarlo es decisión de quien llama, y un framework web ya lo
+hace por petición.
+
 ## Contexto
 
 Toda llamada recibe un `context.Context` como primer argumento, que se pasa al driver — así

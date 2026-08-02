@@ -926,8 +926,24 @@ func (ctx *Engine) CreateTables(entities ...models.Entity) error {
 	})
 }
 
-// Transaction support
+// Transaction runs fn inside a database transaction, committing when it returns nil and
+// rolling back otherwise.
+//
+// A nested call joins the surrounding transaction rather than opening a second one. That
+// matters twice over: Create, Write, Delete and Insert each wrap themselves in a
+// transaction, so without joining, work done inside a user transaction would commit
+// independently of it — and the second BeginTx would hold a second pooled connection while
+// the first is still held, deadlocking any pool smaller than the nesting depth.
+//
+// The rollback is deferred, so a panic in fn releases the connection on its way out
+// instead of leaking it for the lifetime of the process.
 func (ctx *Engine) Transaction(fn func(*Engine) error) error {
+	if ctx.tx != nil {
+		// Already in a transaction: run in it. An error propagates to whichever call
+		// opened it, which is what rolls the whole thing back.
+		return fn(ctx)
+	}
+
 	tx, err := ctx.db.BeginTx(ctx.ctx, nil)
 	if err != nil {
 		return err
@@ -939,12 +955,23 @@ func (ctx *Engine) Transaction(fn func(*Engine) error) error {
 	txCtx := *ctx
 	txCtx.tx = tx
 
+	committed := false
+	defer func() {
+		if !committed {
+			// Covers the error return and the panic alike. Rolling back an already
+			// finished transaction reports sql.ErrTxDone, which is not interesting here.
+			tx.Rollback()
+		}
+	}()
+
 	if err := fn(&txCtx); err != nil {
-		tx.Rollback()
 		return err
 	}
-
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 func isEntity(arg any) bool {

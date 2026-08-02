@@ -66,13 +66,10 @@ Escritas sin adornos a propósito. Si algo de aquí te afecta, es mejor saberlo 
 
 ## Compilaciones de producción
 
-- **Las claves del registro son posicionales.** Añadir, quitar o reordenar una clausura en una
-  función desplaza todos los índices posteriores. Regenera antes de cada compilación con
-  `-tags prod` — un registro obsoleto puede resolverse en silencio al cuerpo de otra lambda.
-  Ver [Compilaciones de producción](production.md).
-- **Una lambda de goql anidada dentro de otra clausura no se puede indexar.** El generador la
-  omite de forma ruidosa y la llamada en producción falla con `ErrNoCompiledBody`.
-
+- **Las claves del registro son posicionales**: el nombre base del fichero y una línea.
+  Editar un fichero desplaza las líneas posteriores, así que regenera antes de cada
+  compilación con `-tags prod`; un registro obsoleto falla de forma ruidosa con
+  `ErrNoCompiledBody`. Ver [Compilaciones de producción](production.md).
 ## Deliberadamente no construido
 
 Cada una de estas cosas se consideró y se dejó fuera, no se pasó por alto:

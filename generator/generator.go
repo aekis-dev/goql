@@ -15,7 +15,6 @@ package generator
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -24,6 +23,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/aekis-dev/goql"
@@ -60,6 +60,7 @@ func Run(dir string) error {
 		modulePath: modulePath,
 		moduleRoot: moduleRoot,
 		outputs:    make(map[string]*pkgOutput),
+		keys:       make(map[string]string),
 	}
 
 	log.Printf("goqlc: scanning %s (module %s)", absDir, modulePath)
@@ -102,6 +103,34 @@ type generator struct {
 	modulePath string
 	moduleRoot string
 	outputs    map[string]*pkgOutput
+
+	// keys guards against two lambdas hashing to the same registry key, which the base
+	// name plus line scheme makes possible across directories (two main.go, same line).
+	// A collision is reported rather than silently resolving one lambda to the other body.
+	keys map[string]string
+}
+
+// sortedLits returns the goql lambdas in source order, so the generated registry is stable
+// between runs — ranging over the map directly would shuffle it.
+func sortedLits(fset *token.FileSet, calls map[*ast.FuncLit]string) []*ast.FuncLit {
+	lits := make([]*ast.FuncLit, 0, len(calls))
+	for fl := range calls {
+		lits = append(lits, fl)
+	}
+	sort.Slice(lits, func(i, j int) bool { return lits[i].Pos() < lits[j].Pos() })
+	return lits
+}
+
+// firstStmtLine is the line the Go runtime may report for a closure instead of its `func`
+// keyword: that of the first statement in its body.
+func firstStmtLine(fset *token.FileSet, lit *ast.FuncLit) int {
+	if lit.Body == nil {
+		return fset.Position(lit.Pos()).Line
+	}
+	if len(lit.Body.List) == 0 {
+		return fset.Position(lit.Body.Lbrace).Line
+	}
+	return fset.Position(lit.Body.List[0].Pos()).Line
 }
 
 // findModule walks up from dir to locate go.mod and returns the module path and the
@@ -192,26 +221,16 @@ func (g *generator) processFile(path string) error {
 			continue
 		}
 
-		// Must match runtime.FuncForPC's naming exactly, e.g.
-		// "github.com/you/app.DoThing" or "github.com/you/app.(*Service).Sync".
-		// goql.EnclosingFuncName is shared with dev-mode lookup so the two cannot drift.
-		enclosing := fmt.Sprintf("%s.%s", pkgQualifier, goql.EnclosingFuncName(funcDecl))
-
 		ormCalls := findORMCalls(funcDecl.Body)
 		if len(ormCalls) == 0 {
 			continue
 		}
 
-		// The compiler numbers funcN over the literals written directly in the enclosing
-		// function — 1..n in source order. A nested closure continues the same counter but
-		// is named under its parent, so counting flat would shift every later sibling and
-		// key it to the wrong body. goql.TopLevelFuncLits is shared with dev-mode lookup so
-		// the two cannot drift.
-		for i, fl := range goql.TopLevelFuncLits(funcDecl.Body) {
-			method, isORM := ormCalls[fl]
-			if !isORM {
-				continue
-			}
+		// Every goql lambda in the function, nested ones included. Keys are positional
+		// (goql.LambdaKey), so a literal written inside another closure is keyed like any
+		// other — the funcN numbering this used to rely on could not name one.
+		for _, fl := range sortedLits(g.fset, ormCalls) {
+			method := ormCalls[fl]
 
 			start := g.fset.Position(fl.Pos())
 			end := g.fset.Position(fl.End())
@@ -234,39 +253,34 @@ func (g *generator) processFile(path string) error {
 				preview = preview[:60] + "..."
 			}
 
+			// The runtime attributes a closure's entry either to its `func` keyword or to
+			// its first statement, depending on the body, and the generator cannot know
+			// which. Emitting both anchors means the lookup hits whichever it reports.
+			anchors := map[int]bool{start.Line: true, firstStmtLine(g.fset, fl): true}
 			out := g.outputFor(dir, file.Name.Name)
-			out.entries = append(out.entries, &entry{
-				key:     computeKey(fmt.Sprintf("%s.func%d", enclosing, i+1)),
-				comment: fmt.Sprintf("%s at %s:%d — %s", method, filepath.Base(path), start.Line, preview),
-				parsed:  parsed,
-			})
-		}
-
-		// A goql lambda written inside another closure cannot be keyed: the compiler names
-		// it under its parent (Outer.func2.func5), a scheme goql does not reproduce. Say so,
-		// rather than emitting a key that would resolve to something else. In prod such a
-		// call fails loudly with "no compiled body".
-		for fl, method := range ormCalls {
-			if !isTopLevel(funcDecl.Body, fl) {
-				log.Printf("goqlc: skipping %s lambda at %s:%d — it is nested inside another "+
-					"closure, which cannot be keyed; move it to the top level of its function",
-					method, filepath.Base(path), g.fset.Position(fl.Pos()).Line)
+			for line := range anchors {
+				key := goql.LambdaKey(path, line)
+				// The full path, not the base name the key uses: two files that share a
+				// base name are exactly the collision this guards against, so recording
+				// them under the same description would hide it.
+				where := fmt.Sprintf("%s:%d", path, line)
+				if prev, clash := g.keys[key]; clash && prev != where {
+					return fmt.Errorf(
+						"goqlc: %s and %s would share a registry key — keys are the file's "+
+							"base name and a line, so move one of the lambdas to a different line",
+						prev, where)
+				}
+				g.keys[key] = where
+				out.entries = append(out.entries, &entry{
+					key:     key,
+					comment: fmt.Sprintf("%s at %s:%d — %s", method, filepath.Base(path), start.Line, preview),
+					parsed:  parsed,
+				})
 			}
 		}
 	}
 
 	return nil
-}
-
-// isTopLevel reports whether a literal is written directly in body rather than inside
-// another function literal.
-func isTopLevel(body *ast.BlockStmt, target *ast.FuncLit) bool {
-	for _, fl := range goql.TopLevelFuncLits(body) {
-		if fl == target {
-			return true
-		}
-	}
-	return false
 }
 
 func (g *generator) outputFor(dir, pkgName string) *pkgOutput {
@@ -327,11 +341,6 @@ func calleeName(fun ast.Expr) string {
 		return f.Name
 	}
 	return ""
-}
-
-func computeKey(runtimeName string) string {
-	sum := sha256.Sum256([]byte(runtimeName))
-	return fmt.Sprintf("%x", sum[:8])
 }
 
 func (g *generator) emit(out *pkgOutput) error {

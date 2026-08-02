@@ -60,11 +60,9 @@ Kept blunt on purpose. If something here matters to you, it is better to know no
 
 ## Production builds
 
-- **Registry keys are positional.** Adding, removing or reordering a closure in a function
-  shifts every later index. Regenerate before every `-tags prod` build — a stale registry can
-  silently resolve to a different lambda's body. See [Production builds](production.md).
-- **A goql lambda nested inside another closure cannot be keyed.** The generator skips it
-  loudly and the prod call fails with `ErrNoCompiledBody`.
+- **Registry keys are positional** — the file's base name and a line. Editing a file shifts
+  the lines below the edit, so regenerate before every `-tags prod` build; a stale registry
+  fails loudly with `ErrNoCompiledBody`. See [Production builds](production.md).
 
 ## Deliberately not built
 

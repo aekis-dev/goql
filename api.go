@@ -290,6 +290,17 @@ func validateLambda[T any](fn any, wantPredicate bool) error {
 
 	first := fnType.In(0)
 	if first.Kind() != reflect.Ptr {
+		// A leading []*T is the self handle of a recursive query. That form is only
+		// meaningful for a query bound inside another lambda and read through goql.From,
+		// because the rows it accumulates need an enclosing query to select from them.
+		// Reporting it as "not a pointer" sends the reader to fix the wrong thing.
+		if first.Kind() == reflect.Slice && first.Elem() == reflect.PointerTo(want) {
+			return fmt.Errorf(
+				"%w: a lambda taking []*%s is the self handle of a recursive query, which "+
+					"has to be bound inside another lambda and read with from.Query — it "+
+					"cannot be passed straight to this call",
+				ErrInvalidLambda, want.Name())
+		}
 		return fmt.Errorf(
 			"%w: first parameter must be *%s, not %s — the body describes the row being "+
 				"matched, so it is written as a mutation through a pointer",

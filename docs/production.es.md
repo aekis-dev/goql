@@ -66,42 +66,47 @@ ambos modos, y se ejecuta en cada cambio.
 
 ## La regla que te va a morder
 
-**Las claves son posicionales.** Un cuerpo se indexa por el SHA-256 del nombre de su función en
-el runtime, que incluye el índice `funcN` del compilador. Un binario de producción no tiene
-código que hashear, así que el nombre de la función en el runtime es la única identidad
-disponible.
+**Las claves son posicionales.** Un cuerpo se indexa por el SHA-256 de su posición en el
+código: el nombre base de su fichero y la línea que el runtime de Go informa para él. Un
+binario de producción no tiene fuente que leer, así que una posición es la única identidad
+disponible en tiempo de ejecución.
 
 En consecuencia:
 
-!!! danger "Añadir, quitar o reordenar una clausura desplaza todos los índices posteriores de esa función."
-    Sin regenerar, una búsqueda puede resolverse en silencio al cuerpo de **otra lambda**: la
-    consulta equivocada, sin ningún error. Ejecuta `go generate` antes de cada compilación con
-    `-tags prod`, tanto en CI como en local.
+!!! danger "Editar un fichero desplaza las líneas por debajo del cambio."
+    Sin regenerar, la búsqueda no encuentra entrada y la llamada falla con
+    `ErrNoCompiledBody`. Ejecuta `go generate` antes de cada compilación con `-tags prod`,
+    tanto en CI como en local.
 
-Se construyó una salvaguarda que comparaba el tipo de entidad para el que se generó cada
-cuerpo y luego se eliminó por decisión propia, a favor de claves posicionales simples más la
-disciplina de regenerar siempre.
+Ese fallo es ruidoso a propósito. Un esquema anterior indexaba por el índice `funcN` del
+compilador, donde añadir o reordenar una clausura resolvía en silencio una lambda a un
+**cuerpo distinto**: la consulta equivocada, sin error.
 
-### Anidamiento dentro de una clausura
+### Por qué la posición y no el nombre de la función
 
-Las clausuras escritas directamente en una función reciben `1..n` en orden de aparición. Las
-anidadas continúan el mismo contador pero se nombran *bajo su padre*, así que nunca toman el
-número de una hermana — goql cuenta solo los literales de primer nivel, que es lo que hace
-correcta la numeración.
-
-Una lambda de goql anidada **dentro de otra clausura** no se puede indexar, porque su nombre en
-el runtime se construye a partir de una cadena de padres que goql no reproduce. El generador
-la **omite de forma ruidosa**:
+El nombre que el runtime da a una clausura solo es estable para una escrita directamente en
+una función. El compilador lo reescribe para una clausura anidada, y de forma distinta según
+el inlining:
 
 ```text
-goqlc: skipping Select lambda at main.go:216 — it is nested inside another closure,
-which cannot be keyed; move it to the top level of its function
+                 compilación normal                     -gcflags=all=-l
+nivel superior   main.Outer.func2                       main.Outer.func2      (igual)
+anidada          main.Outer.Outer.func2.func4           main.Outer.func2.1
+dos niveles      main.Outer.Outer.func3.…func5.func6    main.Outer.func3.1.1
 ```
 
-En producción, esa llamada falla con «no compiled body», que es el fallo ruidoso correcto.
-Ojo: esto se refiere a una lambda de goql dentro de un `func() {…}` que escribiste tú — una
-[subconsulta](subqueries.md) anidada dentro de otra lambda de goql no tiene problema, porque
-se analiza como parte del cuerpo de su padre.
+La línea que informa el runtime es idéntica en todos esos casos, y también con `-N`, `-N -l`
+y `-race`. Eso es lo que permite indexar como cualquier otra una lambda escrita dentro de otra
+clausura, que es la forma que impone [`Transaction`](transactions.md), ya que recibe una.
+
+De ahí salen dos detalles:
+
+- El generador emite una clave para **las dos líneas que el runtime puede informar**, la de
+  la palabra `func` y la de la primera sentencia, porque cuál elige depende de la forma del
+  cuerpo.
+- Las claves usan el **nombre base** del fichero, no su ruta, así que las compilaciones con
+  `-trimpath` siguen coincidiendo. goqlc se niega a generar si dos lambdas del build
+  colisionarían, nombrando ambas.
 
 ## CI sugerido
 

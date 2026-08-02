@@ -35,7 +35,8 @@ func main() {
 	}
 
 	fmt.Println("Creating tables...")
-	if err := e.CreateTables(&models.Customer{}, &models.Order{}, &models.Tag{}, &models.OrderArchive{}); err != nil {
+	if err := e.CreateTables(&models.Customer{}, &models.Order{}, &models.Tag{}, &models.OrderArchive{},
+		&models.Category{}); err != nil {
 		log.Fatal("create tables: ", err)
 	}
 
@@ -397,6 +398,33 @@ func main() {
 		log.Fatal("walk categories: ", err)
 	}
 	fmt.Printf("Category tree: %d nodes, deepest level %d\n", tree[0].Nodes, tree[0].Deepest)
+
+	// A lambda written inside a transaction closure. Keys are positional, so a nested
+	// literal compiles into the registry like any other — this is what the dev/prod
+	// comparison checks for that case.
+	if err := e.Transaction(func(tx *goql.Engine) error {
+		urgent, err := goql.Select[models.Order](ctx, tx, func(o *models.Order) bool {
+			return goql.Filter(o.Tags, func(t *models.Tag) bool { return t.Name == "urgent" })
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Orders tagged urgent, read inside a transaction: %d\n", len(urgent))
+
+		// Two levels deep, to prove the registry keys a doubly-nested literal too.
+		return tx.Transaction(func(inner *goql.Engine) error {
+			vip, err := goql.Select[models.Order](ctx, inner, func(o *models.Order) bool {
+				return goql.Filter(o.Tags, func(t *models.Tag) bool { return t.Name == "vip" })
+			})
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Orders tagged vip, read two levels deep: %d\n", len(vip))
+			return nil
+		})
+	}); err != nil {
+		log.Fatal("transactional select: ", err)
+	}
 
 	// --- Set operations: each branch is a projection into the same result type, so the
 	// compiler checks they match. Options on the outer lambda apply to the combination.

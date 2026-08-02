@@ -14,8 +14,9 @@ compiled into SQL. The Go closures are *not executed* — their bodies are inspe
 ### Packages
 
 Paths below are the **current** layout (Phase F, §9). Sections 2–8 were written against the
-earlier `pkg/orm`, `pkg/query`, … layout and their file references should be read with that
-in mind: `pkg/orm` became the root package, and `pkg/X` became `X`.
+earlier `pkg/orm`, `pkg/query`, … layout: `pkg/orm` became the root package and `pkg/X`
+became `X`. Their prose still describes that layout, but every file link has been repointed
+at the current paths.
 
 | Package | Responsibility |
 |---|---|
@@ -41,9 +42,9 @@ in mind: `pkg/orm` became the root package, and `pkg/X` became `X`.
 - `CreateTables(...)`, `EnableForeignKeys()`.
 
 ### Write/read value conversion
-- **Write**: `query.toDriverArg` ([ddl.go](pkg/query/ddl.go)) unwraps pointers (nil→NULL),
+- **Write**: `query.toDriverArg` ([ddl.go](query/ddl.go)) unwraps pointers (nil→NULL),
   honors `driver.Valuer`, and JSON-marshals maps/structs/slices (except `time.Time` and `[]byte`).
-- **Read**: `orm.setFieldValue` ([helpers.go](pkg/orm/helpers.go)) handles scalars, `time.Time`
+- **Read**: `orm.setFieldValue` ([helpers.go](helpers.go)) handles scalars, `time.Time`
   (multi-layout), nullable pointers, and `[]byte`. **It does NOT unmarshal JSON into struct/map/slice fields** — see backlog §3.
 
 ### Dev vs Prod
@@ -61,7 +62,7 @@ Target: improve usage on the existing base. DB stance: **portable across Postgre
 ### Decision A — Type-safe returns via generics
 - **Decision**: Replace `[]any` returns with generic forms, e.g. `Create[T](ctx, []T) ([]*T, error)`,
   `Search[T](ctx, pred) ([]*T, error)`, eliminating caller-side `.(*models.Order)` casts seen
-  throughout [main.go](pkg/main.go).
+  throughout [main.go](examples/demo/main.go).
 - **Rationale**: Casts are the dominant ergonomic cost today and a frequent error source.
 - **Alternatives considered**: Keep `[]any` (status quo, rejected — poor DX); code-generated
   typed wrappers per model (rejected — more codegen surface than needed now).
@@ -84,27 +85,27 @@ Target: improve usage on the existing base. DB stance: **portable across Postgre
 - **Decision**: struct/map/slice fields read **and** write as JSON, gated on the declared
   column type being `jsonb`. Detection rule everywhere: `strings.ToLower(field.Type) == "jsonb"`.
 - **Status**: Done.
-  - **Write — Create**: `EntityCreate` ([create.go](pkg/query/create.go)) marshals when
+  - **Write — Create**: `EntityCreate` ([create.go](query/create.go)) marshals when
     `Type == "jsonb"`; fixed a bug where the scalar branch appended a raw `reflect.Value`
     instead of `fv.Interface()`.
   - **Write — overloaded `Write`**: `EntityWrite` (entity-diff form) and `LambdaWrite`
-    (lambda form) ([write.go](pkg/query/write.go)) both marshal when `Type == "jsonb"`.
+    (lambda form) ([write.go](query/write.go)) both marshal when `Type == "jsonb"`.
     The **entity form is the working JSON path**.
-  - **Read**: `mapColumnsToEntity` ([orm/helpers.go](pkg/orm/helpers.go)) `json.Unmarshal`s
+  - **Read**: `mapColumnsToEntity` ([orm/helpers.go](helpers.go)) `json.Unmarshal`s
     `[]byte`/`string` into the field when `Type == "jsonb"`, via `unmarshalJSONField`. Done
     where the schema/field is available, not inside `setFieldValue` (which lacks schema).
   - **Column-mapping fix (prerequisite)**: `FieldsByDB` was keyed with *quoted* names
     (`"meta"`) since the `strconv.Quote` commit, while drivers report unquoted columns — so
     **no field of any type was being populated on read**. Added `Field.ColumnName()` (raw,
-    unquoted) and keyed `FieldsByDB` by it in [registry.go](pkg/models/registry.go).
+    unquoted) and keyed `FieldsByDB` by it in [registry.go](models/registry.go).
     `GetColumnName()` still returns the quoted form for SQL emission. This single fix repaired
     8 previously-failing read tests across the suite.
 - **Portability convention**: always declare `Type: "jsonb"` on JSON fields; SQLite accepts it
   via type affinity. `InferDBType` already defaults composite Go types to `jsonb`.
-- **Tests**: `pkg/tests/json_test.go` + model `pkg/tests/models/widget.go` (create / entity-write
+- **Tests**: `tests/json_test.go` + model `tests/models/widget.go` (create / entity-write
   / search round-trip).
 - **Known limitation (follow-up)**: the lambda form **cannot** assign a JSON composite literal —
-  `extractValue` ([orm/executor_dev.go](pkg/orm/executor_dev.go)) handles only
+  `extractValue` ([orm/executor_dev.go](executor_dev.go)) handles only
   `BasicLit`/`Ident`/`SelectorExpr`/`UnaryExpr`, not `CompositeLit`. So
   `Write(func(w Widget){ w.Meta = Meta{...} })` fails at parse time. JSON-via-lambda needs
   `CompositeLit` support in the parser — separate task.
@@ -119,7 +120,7 @@ Target: improve usage on the existing base. DB stance: **portable across Postgre
 - **Decision**: Define and improve how `O2M`/`M2M` (and `M2O`) relations are populated when an
   entity is returned from `Search` (eager vs lazy, N+1 avoidance).
 - **Rationale**: Predicates already traverse relations (`for _, t := range o.Tags` in
-  [main.go](pkg/main.go)); the populated-result story needs to match.
+  [main.go](examples/demo/main.go)); the populated-result story needs to match.
 - **Alternatives considered**: TBD — eager-by-default vs explicit preload list vs lazy proxies.
   Needs its own discussion before implementation.
 - **Implementation notes**: Decide the loading strategy and batching approach first; this is the
@@ -152,12 +153,12 @@ Each phase gets its own interfaces-first design discussion before implementation
 Execution order: **0 → 1 → 2 → 3**, then 4/5/6/7 as prioritized (they are independent).
 
 ### Phase 0 — Correctness bugs (fix before building on top)
-1. **Nested-transaction bug** — `GoqlContext.Transaction` ([context.go](pkg/orm/context.go))
+1. **Nested-transaction bug** — `GoqlContext.Transaction` ([context.go](engine.go))
    always calls `db.BeginTx`; `Create`/`Write`/`Delete` wrap themselves in `ctx.Transaction`,
    so inside a user transaction they open a *second independent* tx (SQLite deadlock risk,
    broken atomicity). Fix: if `ctx.tx != nil`, join it (optionally SAVEPOINT for nesting).
 2. **No panic safety in `Transaction`** — a panic in `fn` leaks the tx; needs deferred rollback.
-3. **Closure-variable foot-gun** — `extractValue` ([executor_dev.go](pkg/orm/executor_dev.go))
+3. **Closure-variable foot-gun** — `extractValue` ([executor_dev.go](executor_dev.go))
    turns any identifier into its *name as a string*: `c.Age > minAge` → `WHERE age > 'minAge'`.
    Until Phase 3 adds real parameter support, this must become a hard parse error.
 4. **Infinite recursion in `extractValue` for `UnaryExpr`** — recurses on `expr` instead of
@@ -248,7 +249,7 @@ emission trustworthy, and get the suite green, before later phases build on them
 **Result: 39 tests passing, 0 failing** (baseline was 15 failing), stable across runs.
 
 ### A2 — Table aliasing decided at SQL-build time
-- **Decision**: Introduce `query.AliasMap` ([pkg/query/alias.go](pkg/query/alias.go)) which
+- **Decision**: Introduce `query.AliasMap` ([query/alias.go](query/alias.go)) which
   assigns one alias per table per query: preferred first letter, numeric suffix on collision
   (`orders`→`o`, `order_tags`→`o2`, `tags`→`t`). It is created and threaded by the SQL
   builders, never by the parser. Statements that cannot portably alias their target
@@ -354,7 +355,7 @@ emission trustworthy, and get the suite green, before later phases build on them
 
 ### A4 — Multi-branch parsing (if / else-if / else + switch) with NOT
 - **Decision**: `ParseBody` becomes a flat list of `ParseBranch{Condition, Assignments,
-  RelationAssignments, Selects}` ([pkg/query/parse.go](pkg/query/parse.go)). Each branch's
+  RelationAssignments, Selects}` ([query/parse.go](query/parse.go)). Each branch's
   `Condition` already carries the negation of every preceding arm, so branches are mutually
   exclusive and independent. `LambdaWrite` returns `[]*Query` — **one UPDATE per assigning
   branch**; `Write`'s transaction loop executes them all and sums `RowsAffected`. Predicate
@@ -390,8 +391,8 @@ emission trustworthy, and get the suite green, before later phases build on them
   - **`applyRelationAssignments`** extracted from `Write` onto `GoqlContext`; relation syncing
     now runs per branch, scoped to the rows that branch selects. `Write` also errors when a
     lambda assigns nothing at all, instead of silently doing nothing.
-- **Tests**: `pkg/tests/parser_test.go` covers if/else, else-if chains, both switch forms,
-  guard clauses and the captured-variable rejection; `pkg/tests/write_test.go` adds
+- **Tests**: `tests/parser_test.go` covers if/else, else-if chains, both switch forms,
+  guard clauses and the captured-variable rejection; `tests/write_test.go` adds
   **end-to-end** checks that each arm updates its own disjoint row set (`if/else` and
   `switch` + `default`) against a real database.
 
@@ -422,7 +423,7 @@ check that the compiled registry reproduces the runtime parser.
 - **Decision**: `generator` becomes an **importable package** (`//go:build !prod`) exposing
   `Run(dir)`. Each project adds a small `package main` driver that imports its own model
   packages and calls it, wired up with a directive next to the queries:
-  `//go:generate go run ./tools/goqlc .` — see [pkg/tools/goqlc](pkg/tools/goqlc/main.go).
+  `//go:generate go run ./tools/goqlc .` — see [tools/goqlc](tools/goqlc/main.go).
   There is no separate installed tool.
 - **Rationale**: A standalone binary **cannot work**. Resolving a lambda's fields needs the
   models registered, which only happens when the packages declaring them are imported so
@@ -753,7 +754,7 @@ passing through unquoted, since `DEFAULT 'CURRENT_TIMESTAMP'` would store the wo
 than the time. Booleans render as TRUE/FALSE.
 
 ### Testing
-Per-dialect SQL assertions (`pkg/tests/dialect_test.go`) cover quoting and quote escaping,
+Per-dialect SQL assertions (`tests/dialect_test.go`) cover quoting and quote escaping,
 placeholder style and numbering across a whole statement, open-ended limits, RETURNING,
 the joined-UPDATE shape, insert-ignore spellings, the full type mapping, raw passthrough,
 quoted defaults and auto-increment — 12 tests, no database needed. Live round-trip coverage
@@ -795,7 +796,7 @@ timestamp handling) is still unverified.
   default, Unix domain only, chmod 0600, and a loud log line when it starts. It can apply
   DDL, so it is a control channel into a running process. A wrong token gets 403 — covered
   by the end-to-end test.
-- **The CLI** ([pkg/tools/goqlmigrate](pkg/tools/goqlmigrate/main.go)) re-plans after every
+- **The CLI** ([tools/goqlmigrate](tools/goqlmigrate/main.go)) re-plans after every
   answer, because resolving one question can change the next: a rename consumes a candidate
   that a later question would otherwise offer.
 
@@ -1664,6 +1665,7 @@ explicit joins, expressions and `from.Query` — with one genuinely new idea.
 ### The self-reference is a declared parameter
 
 ```go
+// bound inside an enclosing lambda, and read from it with from.Query
 tree, _ := goql.Select[CatNode](ctx, e, func(t []*CatNode) bool {   // ← t: the rows so far
     roots, _ := goql.Select[CatNode](ctx, e, /* anchor: parent IS NULL, Depth = 0 */)
     children, _ := goql.Select[CatNode](ctx, e,
@@ -1695,6 +1697,11 @@ SELECT COUNT(*) AS "Nodes", MAX(t."Depth") AS "Deepest" FROM "tree" t
   queries". Here recursion is written down three times over — the handle is declared, joined,
   and its condition spelled out — and the three cannot disagree because two of them *are* the
   join.
+- **The snippet above is abridged**: the recursive query is a *binding*, so it lives inside
+  an enclosing lambda that reads it through `from.Query` — which is where the `SELECT
+  COUNT(*) … FROM "tree" t` in the SQL comes from. Passing such a lambda straight to
+  `Select` is refused, and since 2026-08-02 the error says so rather than reporting the
+  leading `[]*T` as "not a pointer".
 - **Why `[]*T`**: it is exactly what a goql call returns, so the handle has the type the rows
   actually have. It also distinguishes itself from every other parameter shape by type, the
   same rule options, params, participants and row handles already use.
@@ -1797,8 +1804,12 @@ structure: `index.md` is English, `index.es.md` its Spanish sibling.
   English site is byte-identical to what it was and a missing translation simply falls back.
 - Nav labels are translated in `mkdocs.yml` (`nav_translations`), so the sidebar is Spanish
   too, and Material's language switcher appears automatically.
-- **Code and SQL blocks are identical across languages** — only prose is translated. A reader
-  comparing the two pages sees the same generated SQL.
+- **Code blocks teach the same code across languages.** Comments *and user-facing string
+  contents* are translated (a printed warning, a column `Comment:`); identifiers, calls,
+  operators and field names are not, so a reader comparing two pages sees the same query and
+  the same generated SQL. `TestDocs_TranslationsShareCode` enforces exactly that invariant by
+  comparing the code with comments removed and string contents blanked — the original claim
+  here said the blocks were *identical*, which they never were.
 - Verified: `mkdocs build --strict` builds both, and a script checks that every internal link
   *and every `#anchor`* resolves in the built HTML for both languages — accented Spanish
   headings slugify to unaccented ids (`## Terminación` → `#terminacion`), which is exactly the
@@ -2115,3 +2126,230 @@ users, err := goql.Search[User](ctx, e, User{Model: goql.Model{ID: userID}})
 `tests/get_test.go` — 7: single key, several keys, a miss, an empty key list, options
 applying, the emitted SQL for both shapes, and Postgres placeholder numbering across the
 keys and the tail.
+
+---
+
+## 26. Transaction propagation and panic safety (fixed 2026-08-02)
+
+**301 tests passing, dev and prod clean, dev/prod demo output byte-identical.**
+
+Roadmap **Phase 0 items 1 and 2** (§3), recorded in 2026-07 as "fix before building on top"
+and then never fixed: Phase A did the parser and SQL emission, Phase 2 was skipped, and only
+its context-plumbing half landed in C1–C3. Found while discussing connection pools, because
+all three symptoms are pool symptoms.
+
+### What was wrong
+`Transaction` called `ctx.db.BeginTx` unconditionally, never checking `ctx.tx`. Six internal
+call sites wrap themselves in it (`createAny`, `writeAny`, `deleteAny`,
+`applyRelationAssignments`, `LambdaInsert`, migrations), so inside a user transaction a
+second, **independent** transaction was opened. Three consequences, all reproduced against a
+real database before fixing:
+
+- **Atomicity was silently broken.** An outer rollback did not undo a nested `Create` — the
+  row survived, with no error reported. This is the worst of the three: wrong results, no
+  signal.
+- **A pool smaller than the nesting depth deadlocked.** The outer transaction pins a
+  connection and the inner `BeginTx` waits for a second one. With `SetMaxOpenConns(1)` the
+  process hangs until the context deadline; `database/sql` has no deadlock detection. A small
+  pool is the normal SQLite configuration.
+- **A panic leaked the connection permanently.** There was no deferred rollback, so neither
+  `Rollback` nor `Commit` ran and the `*sql.Tx` was never finished — `inuse=1 idle=0` for the
+  lifetime of the process. One panicking web handler costs one connection, forever.
+
+### The fix
+- **`ctx.tx != nil` runs `fn` in the existing transaction** rather than opening another. An
+  inner error propagates to whichever call opened the transaction, which is what rolls the
+  whole thing back.
+- **The rollback is deferred**, guarded by a `committed` flag, so the error return and the
+  panic path share one exit. The panic is **not** recovered: recovering is the caller's
+  decision, and a web framework already does it per request.
+- **No SAVEPOINT.** Joining is what makes the semantics correct; savepoints would add partial
+  rollback, which is a feature and not part of this defect. Deliberately left out.
+
+### The documentation already claimed the fixed behaviour
+`docs/transactions.md` said nesting joins the outer transaction and that not doing so
+"previously risked a deadlock on SQLite and broke atomicity everywhere" — written from the
+Phase 0 plan rather than from the code, and untrue until now. It is true as of this change.
+Panic behaviour was undocumented and now has its own section in both languages.
+
+### Tests
+`tests/transaction_test.go` — 5, opening their own database because they need
+`SetMaxOpenConns`: an outer rollback undoing nested work, a nested commit landing, no pool
+deadlock at `MaxOpenConns(1)`, a panic returning its connection *and* propagating, and a
+panic rolling its work back. **Four of the five were confirmed to fail before the fix**, each
+for its own reason.
+
+### Found alongside: the demo never ran from a clean database
+The deep-path demo added in §24 queries `Category` at [examples/demo/main.go:233](examples/demo/main.go:233)
+but the table was not created until line 342. It only ever worked because `demo.db` was left
+over from an earlier run — so §24's dev/prod comparison was made against a stale database
+file. `Category` moved into the startup `CreateTables`; `CREATE TABLE IF NOT EXISTS` makes
+the later call harmless. Both modes now run from an empty database and still produce
+byte-identical output.
+
+---
+
+## 27. Full review against the code and the docs (2026-08-02)
+
+A systematic pass over everything §1–§26 claims, checked against the implementation and the
+documentation. **313 tests passing, dev and prod clean, dev/prod demo output byte-identical.**
+
+Method: turn claims into executable checks rather than reading for agreement — the same
+approach that found the §22 and §26 defects. Four new permanent test files came out of it.
+
+### The finding that matters: a lambda cannot be written inside another closure
+
+`Transaction` takes a closure, so **every lambda-based call written inside a transaction
+fails** with `unsupported nested function literal`. `docs/transactions.md`'s central example —
+"this is one transaction, not three", showing `Create`, `Update[Order]` and `Delete[Tag]`
+together — cannot be written as shown, because `Update` and `Delete` take lambdas.
+
+- **Cause**: `runtimeLambdaID` ([executor_dev.go](executor_dev.go)) takes everything after the
+  last `.func` in the runtime name and `Atoi`s it. A nested closure is named `Outer.func1.1`,
+  so the parse fails. §12 recorded this as a generator concern ("skipped loudly", "in prod
+  such a call fails with no compiled body") and did not notice that **dev mode rejects it
+  too**, nor that `Transaction` makes the case ordinary rather than exotic.
+- **Blast radius is narrower than it first looks**: struct calls (`Create`, `Write`,
+  `Remove`, `Search`, `Get`) are unaffected, and the documented gin middleware still works,
+  because handlers are separate functions whose lambdas are top-level in them. It is
+  specifically a lambda written *lexically* inside another closure.
+- **Two workarounds, both verified**: hoist the lambda to the enclosing function, or put the
+  goql call in a named function. Documented in the transactions and limitations pages, in
+  both languages, and pinned by `TestIntegration_HoistedLambdaWorksInTransaction`.
+- **Not fixed here.** The fix is to parse the whole index chain (`func1.1` → `[1, 1]`) and
+  walk `TopLevelFuncLits` recursively, with the generator kept in step. That is real work
+  with an empirical question in it — the runtime's nested naming is `Outer.func1.1` here but
+  §12 observed `Outer.Outer.func1.func4` elsewhere, so the format has to be established
+  before relying on it. Left as a decision rather than folded into a review.
+
+### Everything else checked out
+
+- **Every documented refusal fires.** 15 parse/build refusals plus 3 enforced at the API
+  boundary, now pinned in `tests/refusals_test.go`. No silent acceptance was found — which is
+  the outcome that matters, since a refusal that does not fire produces wrong answers rather
+  than an error.
+- **Every lambda in the docs parses.** `tests/doclambda_test.go` reads `docs/*.md` **at test
+  time** and runs all 45 through the real parser, so an example edited in the documentation
+  is checked on the next run instead of drifting from a snapshot. Two rules were needed to
+  make it meaningful: only outermost lambdas (a nested one may name a handle its parent
+  declares), and skip examples marked `✗`, which are deliberately invalid.
+- **Cross-feature integration**: `Get` with `Preload` and with an empty `Preload` overriding
+  schema defaults, `Get` inside a transaction seeing uncommitted work and losing it on
+  rollback, `Filter` composing inside a transactional `Update`, a two-hop path with an
+  option tail. All correct; `tests/integration_test.go`.
+- **API surface matches the docs.** Every `goql.X` identifier the docs name exists. The three
+  that do not — `goql.Ptr`, `goql.P`, `goql.Args` — appear only in rejected-alternatives
+  prose, describing things deliberately absent.
+
+### Two documentation defects fixed
+
+- **§22's translation claim was never true.** It said code and SQL blocks are *identical*
+  across languages; 34 blocks differ, because comments are translated — correctly. Stripping
+  comments leaves two further differences, both user-facing string contents (a printed
+  warning, a column `Comment:`), also correct. The claim is restated as the invariant that
+  actually holds, and `TestDocs_TranslationsShareCode` enforces it by comparing code with
+  comments removed and string contents blanked.
+- **§21's recursive snippet is abridged in a way that misleads.** It shows
+  `tree, _ := goql.Select[CatNode](ctx, e, func(t []*CatNode) bool {…})` as though top-level,
+  while the SQL beneath it contains an outer `SELECT COUNT(*) … FROM "tree" t` that the Go
+  code never shows. Read literally it is a form the API refuses. Annotated, and the refusal
+  now says what is wrong — it previously reported the leading `[]*T` as "first parameter must
+  be *CatNode, not ", pointing at the wrong thing entirely.
+
+### Housekeeping
+- **12 stale `pkg/…` file links** in §2–§8, dead since the §9 F1 layout move, repointed at
+  the current paths (`pkg/orm/context.go` → `engine.go`, where `Transaction` now lives).
+  Historical narrative still says `pkg/`, correctly.
+- The demo's `Category` table fix from §26 means the whole suite now runs from a clean tree.
+
+---
+
+## 28. Lambdas identified by source position (implemented 2026-08-02)
+
+**332 tests passing, dev and prod clean, dev/prod demo output byte-identical.**
+
+Fixes the defect §27 found and left open: a goql lambda written inside another closure was
+refused, and `Transaction` takes a closure, so no lambda-based call could appear in one.
+
+### The mechanism that was wrong
+`lambdaID` derived a lambda's identity from the runtime's name for it:
+
+```go
+index, err := strconv.Atoi(name[marker+len(".func"):])
+if err != nil {
+    return runtimeLambdaID{}, fmt.Errorf(
+        "goql: unsupported nested function literal %s — pass the lambda directly", name)
+}
+```
+
+`main.Outer.func2` parses; `main.Outer.func2.1` does not, so nesting was refused outright.
+
+**The reason to refuse it was better than recorded.** Measured, rather than assumed: the
+runtime's name for a nested closure is **not stable** — it depends on inlining.
+
+```
+                 default build                            -gcflags=all=-l
+top-level        main.Outer.func2                         main.Outer.func2      (identical)
+nested           main.Outer.Outer.func2.func4             main.Outer.func2.1
+two deep         main.Outer.Outer.func3.…func5.func6      main.Outer.func3.1.1
+in a passed call main.main.Outer.run.main.Outer.func1.func2   main.Outer.func1.1
+```
+
+The parent chain repeats, the trailing number is a whole-function counter rather than an
+index within the parent, and the function a closure was passed to leaks into the name when it
+is inlined. So "parse the index chain", the obvious fix, would have worked under
+`-gcflags=all=-l` and silently resolved to a **different lambda's body** otherwise — the
+failure §12 exists to prevent. Only the top-level row is inlining-independent, which is
+exactly the case goql supported.
+
+### The identity that is stable: the reported line
+`runtime.FuncForPC(pc).FileLine(pc)` — already called, its line discarded — is identical for
+every one of those cases, and across `-N`, `-l`, `-N -l` and `-race`. Under a `//line`
+directive the runtime and `go/parser` report the same rewritten position, so they agree.
+
+- **Dev**: `runtimeLambdaID` becomes `{file, line}`, and `locateFuncLit` finds the literal at
+  that position instead of counting. Nesting needs no special case — a nested literal has a
+  line like any other.
+- **Prod**: `compiledKey` hashes `basename(file):line`, shared with goqlc through
+  `goql.LambdaKey` the way `EnclosingFuncName` and `TopLevelFuncLits` already are. The base
+  name rather than the path, because `-trimpath` rewrites paths; goqlc errors if two lambdas
+  in the build would collide.
+- **The failure mode improves.** A positional `funcN` key went stale on reordering and
+  resolved to the wrong body *silently*. A line key goes stale on any edit above the lambda
+  and simply is not found — `ErrNoCompiledBody`, loud. Regenerating was already required.
+
+### Two things measurement forced, that guessing would have missed
+- **The runtime reports the line of the first *statement*, or of the `func` keyword,
+  depending on the body's shape.** Both were observed. Dev considers both anchors; the
+  generator emits a key for each, since it cannot know which the compiler will choose.
+- **A line does not identify a literal uniquely.** In
+  `urgent, err := goql.Select[Order](ctx, tx, func(o *Order) bool {`, the enclosing closure's
+  first statement and the goql lambda's `func` keyword are the same line. Preferring the
+  outermost candidate — right for `return goql.Filter(o.Tags, func(t *Tag) bool { … })` —
+  picked the transaction closure here and parsed `if err != nil` as a predicate. **The demo
+  caught this, not the tests**: dev failed while prod succeeded, the first time the two have
+  disagreed.
+  The fix is to match the **signature** against `reflect.TypeOf(fn)` — parameter and result
+  counts, and type names — which separates `func(*goql.Engine) error` from `func(*Order) bool`
+  regardless of position. Positional tie-breaks remain only for genuinely identical shapes.
+
+### Verified after the fact, because reasoning is not evidence
+- **`-trimpath` prod build**: byte-identical to the untrimmed one. This was the riskiest
+  assumption behind using the file's base name.
+- **Two-level nesting through the prod registry**: the demo reads inside a transaction and
+  again inside a nested one; both modes still agree.
+- **Two lambdas on one line, identical signatures, both nested** — the one case with no
+  discriminator left — fails loudly (`holds 2 function literals and this one is nested, so
+  its position cannot be told apart`) rather than picking one.
+- **goqlc's collision guard did not fire when first tested.** It recorded each key under
+  `filepath.Base(path)`, the same string the key itself is built from, so two files sharing a
+  base name looked like the same lambda and the clash was invisible. It records the full path
+  now, and reports both files. Found only by building a colliding pair on purpose.
+
+### Consequences
+- `Transaction` now composes with every call, so `docs/transactions.md`'s "one transaction,
+  not three" example is writable as shown for the first time.
+- The workarounds §27 documented (hoist the lambda, or use a named function) still work and
+  are still tested, but are no longer required.
+- The demo gained a lambda inside a transaction whose body contains a further literal, so the
+  dev/prod comparison covers the case that broke.

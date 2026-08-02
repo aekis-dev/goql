@@ -703,7 +703,7 @@ func (e *DebugExecutor) parseLambda(fn any, call string) (*query.ParseQuery, err
 		return body, nil
 	}
 
-	funcLit, err := e.locateFuncLit(id)
+	funcLit, err := e.locateFuncLit(id, reflect.TypeOf(fn))
 	if err != nil {
 		return nil, err
 	}
@@ -1671,17 +1671,35 @@ func (e *DebugExecutor) mapOperator(op token.Token) (string, error) {
 	}
 }
 
-// runtimeLambdaID identifies a function literal by its source file, its enclosing
-// function, and the compiler's positional index among that function's literals — the
-// same numbering goqlc reproduces ahead of time.
+// runtimeLambdaID identifies a function literal by the source position the runtime reports
+// for it, with the compiler's positional numbering kept only to break a tie.
+//
+// The line is the primary key because it is the one identifier that survives everything the
+// compiler does. Verified across -N, -l, -N -l and -race, and through a //line directive
+// (where the runtime and go/parser report the same rewritten position):
+//
+//	                        default build                                     -gcflags=all=-l
+//	top-level closure       main.TopLevel.func2                               (identical)
+//	nested closure          main.TopLevel.TopLevel.func2.func4                main.TopLevel.func2.1
+//	two levels deep         main.TopLevel.TopLevel.func3.…func5.func6         main.TopLevel.func3.1.1
+//	created in a call       main.main.Outer.run.main.Outer.func1.func2        main.Outer.func1.1
+//
+// Only the first row is stable, which is why keying on the funcN index supported top-level
+// literals and nothing else. The reported *line* is identical in every one of those cases,
+// so it identifies a nested literal as readily as a top-level one.
 type runtimeLambdaID struct {
-	file      string
+	file string
+	line int
+
+	// enclosing and index reproduce the old scheme, used only when a line carries more
+	// than one literal. They are meaningful for a top-level literal, whose runtime name
+	// the compiler does not rewrite.
 	enclosing string // e.g. "DoThing" or "(*Service).Sync"
-	index     int    // 1-based, matching the runtime's funcN suffix
+	index     int    // 1-based, matching the runtime's funcN suffix; 0 when not top-level
 }
 
 func (id runtimeLambdaID) cacheKey() string {
-	return fmt.Sprintf("%s#%s#%d", id.file, id.enclosing, id.index)
+	return fmt.Sprintf("%s#%d#%s#%d", id.file, id.line, id.enclosing, id.index)
 }
 
 // lambdaID resolves a function value to the literal it was compiled from.
@@ -1699,7 +1717,7 @@ func lambdaID(fn any) (runtimeLambdaID, error) {
 	if rf == nil {
 		return runtimeLambdaID{}, fmt.Errorf("goql: could not resolve function pointer")
 	}
-	file, _ := rf.FileLine(pc)
+	file, line := rf.FileLine(pc)
 	name := rf.Name()
 
 	marker := strings.LastIndex(name, ".func")
@@ -1708,55 +1726,112 @@ func lambdaID(fn any) (runtimeLambdaID, error) {
 			"goql: %s is not a function literal — pass a lambda written at the call site", name)
 	}
 
-	index, err := strconv.Atoi(name[marker+len(".func"):])
-	if err != nil {
-		// Nested closures are named func1.2; goql only parses literals passed directly.
-		return runtimeLambdaID{}, fmt.Errorf(
-			"goql: unsupported nested function literal %s — pass the lambda directly", name)
+	id := runtimeLambdaID{file: file, line: line}
+
+	// A trailing integer means the compiler left the name in its top-level form
+	// ("pkg.DoThing.func2"). Anything else is a nested literal, whose name the compiler
+	// rewrites — see the type's comment. The line identifies it either way; this only
+	// records what the old scheme knew, for the same-line tie-break.
+	if index, err := strconv.Atoi(name[marker+len(".func"):]); err == nil {
+		// Strip the package qualifier, which may itself contain dots and slashes
+		// ("github.com/you/app.DoThing" → "DoThing").
+		qualified := name[:marker]
+		if slash := strings.LastIndex(qualified, "/"); slash != -1 {
+			qualified = qualified[slash+1:]
+		}
+		if dot := strings.Index(qualified, "."); dot != -1 {
+			qualified = qualified[dot+1:]
+		}
+		id.enclosing, id.index = qualified, index
 	}
 
-	// Strip the package qualifier, which may itself contain dots and slashes
-	// ("github.com/you/app.DoThing" → "DoThing").
-	qualified := name[:marker]
-	if slash := strings.LastIndex(qualified, "/"); slash != -1 {
-		qualified = qualified[slash+1:]
-	}
-	if dot := strings.Index(qualified, "."); dot != -1 {
-		qualified = qualified[dot+1:]
-	}
-
-	return runtimeLambdaID{file: file, enclosing: qualified, index: index}, nil
+	return id, nil
 }
 
 // locateFuncLit parses the lambda's source file and returns the literal identified by
 // id. This replaces an earlier hand-rolled brace/paren scanner, which desynchronized on
 // braces inside strings and could not tell apart two literals on the same line.
-func (e *DebugExecutor) locateFuncLit(id runtimeLambdaID) (*ast.FuncLit, error) {
+func (e *DebugExecutor) locateFuncLit(id runtimeLambdaID, want reflect.Type) (*ast.FuncLit, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, id.file, nil, parser.SkipObjectResolution)
 	if err != nil {
 		return nil, fmt.Errorf("goql: failed to parse %s: %w", id.file, err)
 	}
 
-	for _, decl := range file.Decls {
-		funcDecl, ok := decl.(*ast.FuncDecl)
-		if !ok || funcDecl.Body == nil {
-			continue
+	// The runtime attributes a closure's entry either to its `func` keyword or to its first
+	// statement, depending on the body — both were observed. So candidates are literals
+	// whose source range covers the reported line, narrowed by those two anchors.
+	var covering, anchored []*ast.FuncLit
+	ast.Inspect(file, func(n ast.Node) bool {
+		lit, ok := n.(*ast.FuncLit)
+		if !ok {
+			return true
 		}
-		if EnclosingFuncName(funcDecl) != id.enclosing {
-			continue
+		start, end := fset.Position(lit.Pos()).Line, fset.Position(lit.End()).Line
+		if id.line < start || id.line > end {
+			return true
 		}
+		covering = append(covering, lit)
+		if start == id.line || firstStmtLine(fset, lit) == id.line {
+			anchored = append(anchored, lit)
+		}
+		return true
+	})
 
-		lits := TopLevelFuncLits(funcDecl.Body)
-		if id.index >= 1 && id.index <= len(lits) {
-			return lits[id.index-1], nil
+	candidates := anchored
+	if len(candidates) == 0 {
+		candidates = covering
+	}
+
+	// Two literals genuinely share an anchor when one opens on the line where the other's
+	// first statement sits — exactly what a lambda passed to a call inside a closure looks
+	// like. Their *signatures* differ, though, and the runtime value gives us the one we
+	// are looking for, so match on that before falling back to anything positional.
+	if len(candidates) > 1 {
+		if matching := signatureMatches(candidates, want); len(matching) > 0 {
+			candidates = matching
+		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0], nil
+	}
+
+	// A lambda whose first statement contains another literal of the same shape shares its
+	// anchor — `return goql.Filter(o.Tags, func(t *Tag) bool { … })`. The goql lambda is the
+	// enclosing one, and an inner literal is parsed as part of its body rather than looked
+	// up on its own, so the outermost candidate is the right one.
+	if outer := outermost(candidates); outer != nil {
+		return outer, nil
+	}
+	onLine := candidates
+
+	// Several literals share the line. Fall back to the compiler's positional numbering,
+	// which is meaningful for a top-level literal — that is the case the old scheme
+	// handled, and TestParse_TwoLambdasOnOneLine covers it.
+	if len(onLine) > 1 && id.index >= 1 {
+		for _, decl := range file.Decls {
+			funcDecl, ok := decl.(*ast.FuncDecl)
+			if !ok || funcDecl.Body == nil || EnclosingFuncName(funcDecl) != id.enclosing {
+				continue
+			}
+			lits := TopLevelFuncLits(funcDecl.Body)
+			if id.index <= len(lits) {
+				return lits[id.index-1], nil
+			}
 		}
 	}
 
+	if len(onLine) > 1 {
+		return nil, fmt.Errorf(
+			"goql: %s:%d holds %d function literals and this one is nested, so its position "+
+				"cannot be told apart — put them on separate lines",
+			id.file, id.line, len(onLine))
+	}
+
 	return nil, fmt.Errorf(
-		"goql: could not locate function literal %d of %s in %s — the source on disk may "+
-			"no longer match the running binary",
-		id.index, id.enclosing, id.file)
+		"goql: could not locate a function literal at %s:%d — the source on disk may no "+
+			"longer match the running binary",
+		id.file, id.line)
 }
 
 // EnclosingFuncName renders a function declaration the way the Go runtime names it, so
@@ -1770,6 +1845,121 @@ func (e *DebugExecutor) locateFuncLit(id runtimeLambdaID) (*ast.FuncLit, error) 
 // under their parent (`Outer.func2.…`). Counting every literal flat, as this used to, made a
 // nested closure shift every later sibling's index — so a lookup silently resolved to a
 // *different* lambda's body. Verified against the runtime's own names.
+// firstStmtLine returns the line the Go runtime reports for a closure: that of the first
+// statement in its body, or of the opening brace when the body is empty.
+func firstStmtLine(fset *token.FileSet, lit *ast.FuncLit) int {
+	if lit.Body == nil {
+		return fset.Position(lit.Pos()).Line
+	}
+	if len(lit.Body.List) == 0 {
+		return fset.Position(lit.Body.Lbrace).Line
+	}
+	return fset.Position(lit.Body.List[0].Pos()).Line
+}
+
+// signatureMatches keeps the literals whose declared signature matches the function value
+// actually passed: same parameter and result counts, and the same type names.
+//
+// This is what tells a goql lambda apart from the closure it is written inside — a
+// Transaction's func(*goql.Engine) error against a predicate's func(*Order) bool — when both
+// anchor on the same source line.
+func signatureMatches(lits []*ast.FuncLit, want reflect.Type) []*ast.FuncLit {
+	if want == nil || want.Kind() != reflect.Func {
+		return nil
+	}
+
+	var kept []*ast.FuncLit
+	for _, lit := range lits {
+		params := 0
+		var names []string
+		if lit.Type.Params != nil {
+			for _, field := range lit.Type.Params.List {
+				n := len(field.Names)
+				if n == 0 {
+					n = 1
+				}
+				params += n
+				for i := 0; i < n; i++ {
+					names = append(names, typeBaseName(field.Type))
+				}
+			}
+		}
+		results := 0
+		if lit.Type.Results != nil {
+			for _, field := range lit.Type.Results.List {
+				if n := len(field.Names); n > 0 {
+					results += n
+				} else {
+					results++
+				}
+			}
+		}
+		if params != want.NumIn() || results != want.NumOut() {
+			continue
+		}
+
+		same := true
+		for i := 0; i < want.NumIn() && same; i++ {
+			if names[i] != "" && names[i] != reflectBaseName(want.In(i)) {
+				same = false
+			}
+		}
+		if same {
+			kept = append(kept, lit)
+		}
+	}
+	return kept
+}
+
+// typeBaseName reduces a type expression to the identifier that names it, dropping
+// pointers, slices and package qualifiers: *models.Order and []*Order both give "Order".
+// It returns "" for shapes it cannot reduce, which are then not used for matching.
+func typeBaseName(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return typeBaseName(t.X)
+	case *ast.ArrayType:
+		return typeBaseName(t.Elt)
+	case *ast.SelectorExpr:
+		return t.Sel.Name
+	}
+	return ""
+}
+
+// reflectBaseName is typeBaseName's counterpart for a runtime type.
+func reflectBaseName(t reflect.Type) string {
+	for t.Kind() == reflect.Ptr || t.Kind() == reflect.Slice {
+		t = t.Elem()
+	}
+	return t.Name()
+}
+
+// outermost returns the one literal that encloses every other candidate, or nil when no
+// single candidate does — two literals written side by side on one line, for instance.
+func outermost(lits []*ast.FuncLit) *ast.FuncLit {
+	if len(lits) < 2 {
+		return nil
+	}
+	for _, candidate := range lits {
+		enclosesAll := true
+		for _, other := range lits {
+			if other == candidate {
+				continue
+			}
+			if !(candidate.Pos() <= other.Pos() && other.End() <= candidate.End()) {
+				enclosesAll = false
+				break
+			}
+		}
+		if enclosesAll {
+			return candidate
+		}
+	}
+	return nil
+}
+
 func TopLevelFuncLits(body *ast.BlockStmt) []*ast.FuncLit {
 	var lits []*ast.FuncLit
 	ast.Inspect(body, func(n ast.Node) bool {

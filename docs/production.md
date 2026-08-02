@@ -64,38 +64,43 @@ every change.
 
 ## The rule that will bite you
 
-**Keys are positional.** A body is keyed by the SHA-256 of its runtime function name, which
-embeds the compiler's `funcN` index. A prod binary has no source to hash, so the runtime
-function name is the only identity available.
+**Keys are positional.** A body is keyed by the SHA-256 of its source position — the base
+name of its file, and the line the Go runtime reports for it. A prod binary has no source to
+read, so a position is the only identity available at runtime.
 
 Consequently:
 
-!!! danger "Adding, removing or reordering a closure shifts every later index in that function."
-    Without regenerating, a lookup can silently resolve to a **different lambda's body** —
-    the wrong query, no error. Run `go generate` before every `-tags prod` build, in CI as
-    well as locally.
+!!! danger "Editing a file shifts the lines below the edit."
+    Without regenerating, a lookup finds no entry and the call fails with
+    `ErrNoCompiledBody`. Run `go generate` before every `-tags prod` build, in CI as well as
+    locally.
 
-A guard comparing the entity type each body was generated for was built and then removed by
-choice, in favour of bare positional keys plus the discipline of always regenerating.
+That failure is loud, which is deliberate. An earlier scheme keyed on the compiler's `funcN`
+index, where adding or reordering a closure silently resolved a lambda to a **different
+body** — the wrong query, no error.
 
-### Nesting inside a closure
+### Why position rather than the function name
 
-Closures written directly in a function get `1..n` in source order. Nested ones continue the
-same counter but are named *under their parent*, so they never take a sibling's number — goql
-counts only top-level literals, which is what makes the numbering correct.
-
-A goql lambda nested **inside another closure** cannot be keyed, because its runtime name is
-built from a parent chain goql does not reproduce. The generator **skips it loudly**:
+The runtime's name for a closure is only stable for one written directly in a function. The
+compiler rewrites it for a nested closure, and differently depending on inlining:
 
 ```text
-goqlc: skipping Select lambda at main.go:216 — it is nested inside another closure,
-which cannot be keyed; move it to the top level of its function
+                 default build                          -gcflags=all=-l
+top-level        main.Outer.func2                       main.Outer.func2      (same)
+nested           main.Outer.Outer.func2.func4           main.Outer.func2.1
+two deep         main.Outer.Outer.func3.…func5.func6    main.Outer.func3.1.1
 ```
 
-In prod such a call fails with "no compiled body", which is the correct loud failure. Note
-this is about a goql lambda inside a `func() {…}` you wrote — a
-[subquery](subqueries.md) nested inside another goql lambda is fine, because it is parsed as
-part of its parent's body.
+The line the runtime reports is identical in every one of those, and across `-N`, `-N -l` and
+`-race`. That is what lets a lambda written inside another closure — the shape
+[`Transaction`](transactions.md) forces, since it takes one — be keyed like any other.
+
+Two details fall out of it:
+
+- The generator emits a key for **both lines the runtime may report**, the `func` keyword and
+  the first statement, because which one it picks depends on the body's shape.
+- Keys use the file's **base name**, not its path, so `-trimpath` builds still match. goqlc
+  refuses to generate if two lambdas in the build would collide, naming both.
 
 ## Suggested CI
 
