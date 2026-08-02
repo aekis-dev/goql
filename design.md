@@ -2055,3 +2055,63 @@ func(o *Order, c *Customer, j *goql.Join) bool {
 ### Tests
 `tests/boundquery_test.go` (5), `tests/path_test.go` (8), `tests/joinfield_test.go` (12).
 The demo gained a path join and a two-hop path so the dev/prod comparison covers both.
+
+---
+
+## 25. `Get` — reading by primary key (implemented 2026-08-01)
+
+**296 tests passing, dev and prod clean.**
+
+Listed in the Phase 1 roadmap (§3) alongside the generics work and never built. Until now the
+most common query there is had to be spelled as a partially-built entity, and because `ID`
+lives on the embedded `goql.Model` that meant a nested struct literal:
+
+```go
+users, err := goql.Search[User](ctx, e, User{Model: goql.Model{ID: userID}})
+```
+
+### `Get[T](ctx, e, ids any, opts ...any) ([]*T, error)`
+- **Decision**: one call covering both readings, with `ids` typed `any` — a single key or a
+  slice of them. One key emits `pk = ?`, several emit `pk IN (…)`.
+
+  ```go
+  user, err := goql.Get[models.User](ctx, e, userID)
+  users, err := goql.Get[models.User](ctx, e, []int64{1, 2, 3})
+  ```
+- **Rationale for `any`**: variadic `ids ...any` reads better but consumes the variadic slot
+  `opts` needs for `goql.Preload` — and loading one entity with its relations is the common
+  web-handler shape, so options had to stay. `ids []any` would force `[]any{userID}` on the
+  single-key case that motivated the change. `pred any` is already typed this way for the
+  same reason.
+- **Not `int64`**: a model may declare a non-`ID` primary key of another type. The value binds
+  as a plain placeholder against `schema.PrimaryKey`, so nothing needs to know its Go type.
+- **A slice return removes the not-found question entirely.** A key that matches nothing is
+  absent from the result, so a miss is an empty slice — no `ErrNotFound` sentinel, and no
+  `(nil, nil)` that a forgotten check turns into a panic. Consequence, accepted: the caller
+  checks `len`, and row order is the engine's unless `goql.Sort` is passed.
+- **No keys runs no statement**, rather than a `WHERE` that matches everything.
+
+### Alternatives considered
+- **`Get` + `GetMany` as two functions** (the original proposal) — rejected by the user: one
+  function that happens to emit an equality for a single key says the same thing with half
+  the surface.
+- **`First[T]` with a predicate** — a genuinely separate ergonomic gap (any "one row" lookup
+  still returns a slice you index), deliberately not folded in here.
+- **An `ID(...)` option carrier for `Search`** — still a two-part call for a one-part idea.
+
+### Implementation notes
+- `Dialect.PrimaryKeySearch` ([query/search.go](query/search.go)) mirrors `EntitySearch`:
+  it pins the table name rather than aliasing it, since there is nothing to join to, and
+  reuses `selectList`/`optionsTail` so `Fields`, `Sort`, `Limit` and `Offset` behave
+  identically. Keys bind before the options tail, which is what keeps Postgres numbering in
+  order (`IN ($1, $2) … LIMIT $3`).
+- `Engine.getByKeys` mirrors the entity branch of `searchAny`, including
+  `effectivePreload(opts, schema)` — so **a model's declared `Preload` defaults apply and a
+  passed `goql.Preload` replaces them**, the §7 D2/D3 rule, with nothing new to document.
+- `[]byte` is one key, not a list of bytes, which is how a binary primary key arrives.
+- Nothing in the parser, the generator or the prod registry is touched: `Get` takes no lambda.
+
+### Tests
+`tests/get_test.go` — 7: single key, several keys, a miss, an empty key list, options
+applying, the emitted SQL for both shapes, and Postgres placeholder numbering across the
+keys and the tail.

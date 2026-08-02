@@ -97,6 +97,7 @@ predicate — one model and one operation per call:
 ```go
 created, err := goql.Create(ctx, e, []Customer{{Name: "Alice", Country: "USA"}})
 usa, err := goql.Search(ctx, e, Customer{Country: "USA"})   // non-zero fields → WHERE
+one, err := goql.Get[Customer](ctx, e, 42)                  // by primary key, or a slice of them
 any, err := goql.Exists[Order](ctx, e, func(o *Order) bool { return o.Total > 500 })
 ```
 

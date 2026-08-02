@@ -15,6 +15,7 @@ import (
 //
 //	Create[T]  insert            Search[T]  select by example
 //	Write[T]   update by diff    Remove[T]  delete by primary key
+//	Get[T]     select by primary key
 //
 // Lambda-based, named after the SQL they compile into:
 //
@@ -60,6 +61,62 @@ func Search[T any](ctx context.Context, e *Engine, example T, opts ...any) ([]*T
 		return nil, err
 	}
 	return typedResults[T](results)
+}
+
+// Get finds rows by primary key.
+//
+// ids is either a single key or a slice of them, so both readings stay clean:
+//
+//	user, err := goql.Get[User](ctx, e, userID)
+//	users, err := goql.Get[User](ctx, e, []int64{1, 2, 3})
+//
+// One key emits an equality and several an IN list. A key that matches nothing is simply
+// absent from the result, so a miss is an empty slice rather than an error, and the
+// results are in whatever order the engine returns them — pass goql.Sort to fix one.
+func Get[T any](ctx context.Context, e *Engine, ids any, opts ...any) ([]*T, error) {
+	entity, err := entityOf[T]()
+	if err != nil {
+		return nil, err
+	}
+	keys, err := keyList(ids)
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	options, err := buildOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	results, err := e.withCall(ctx, nil).getByKeys(entity, keys, options)
+	if err != nil {
+		return nil, err
+	}
+	return typedResults[T](results)
+}
+
+// keyList normalises Get's ids argument into the keys to bind. A slice or array is its
+// elements; anything else is one key. []byte is a single key, since that is how a binary
+// primary key arrives rather than a list of bytes.
+func keyList(ids any) ([]any, error) {
+	if ids == nil {
+		return nil, fmt.Errorf("%w: Get needs a primary key, got nil", ErrInvalidParams)
+	}
+
+	v := reflect.ValueOf(ids)
+	switch v.Kind() {
+	case reflect.Slice, reflect.Array:
+		if v.Type().Elem().Kind() == reflect.Uint8 {
+			break
+		}
+		keys := make([]any, v.Len())
+		for i := range keys {
+			keys[i] = v.Index(i).Interface()
+		}
+		return keys, nil
+	}
+	return []any{ids}, nil
 }
 
 // Write updates entities by diffing them against the values they were loaded with, and

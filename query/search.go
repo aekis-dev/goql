@@ -398,6 +398,41 @@ func (d *Dialect) EntitySearch(entities []models.Entity, schema *models.Model, o
 	return &Query{SQL: head + body + tail, Args: append(args, tailArgs...)}, nil
 }
 
+// PrimaryKeySearch selects rows by primary key.
+//
+// One key renders as an equality and several as an IN list, so the single-key lookup that
+// motivates this path does not pay for a list. Like EntitySearch, it names the table in
+// full rather than aliasing it — there is nothing to join to.
+func (d *Dialect) PrimaryKeySearch(keys []any, schema *models.Model, opts *Options) (*Query, error) {
+	s := d.newStmt()
+	qualifier := d.table(schema)
+	s.alias.PinTableName(schema.TableName)
+
+	selectList, err := d.selectList(opts, schema, qualifier)
+	if err != nil {
+		return nil, err
+	}
+
+	var body string
+	if len(keys) == 1 {
+		body = fmt.Sprintf(" WHERE %s = %s", d.primaryKey(schema), s.mark())
+	} else {
+		marks := make([]string, len(keys))
+		for i := range keys {
+			marks[i] = s.mark()
+		}
+		body = fmt.Sprintf(" WHERE %s IN (%s)", d.primaryKey(schema), strings.Join(marks, ", "))
+	}
+
+	tail, tailArgs, err := d.optionsTail(opts, schema, qualifier, s)
+	if err != nil {
+		return nil, err
+	}
+
+	args := append(append([]any{}, keys...), tailArgs...)
+	return &Query{SQL: "SELECT " + selectList + " FROM " + qualifier + body + tail, Args: args}, nil
+}
+
 // entityConditions renders one condition per non-zero column across the given entities.
 func (d *Dialect) entityConditions(entities []models.Entity, schema *models.Model, s *stmt) ([]string, []any) {
 	// column → the distinct values seen for it

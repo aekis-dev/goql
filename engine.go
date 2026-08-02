@@ -97,6 +97,45 @@ func (ctx *Engine) EnableForeignKeys() error {
 	return err
 }
 
+// getByKeys selects rows by primary key. Scanning and preloading follow the same rules as
+// every other read, so a model's declared Preload defaults apply and a Preload option
+// replaces them.
+func (ctx *Engine) getByKeys(entity models.Entity, keys []any, opts *query.Options) ([]any, error) {
+	schema, err := models.GetModel(entity)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get model for entity: %w", err)
+	}
+
+	q, err := ctx.dialect.PrimaryKeySearch(keys, schema, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	if ctx.debugMode {
+		log.Printf("Get by key SQL: %s\n Args: %v", q.SQL, q.Args)
+	}
+
+	rows, err := ctx.query(q.SQL, q.Args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	entityType := reflect.TypeOf(entity)
+	if entityType.Kind() == reflect.Ptr {
+		entityType = entityType.Elem()
+	}
+
+	results, err := scanRows(rows, entityType)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.preloadRelations(results, schema, effectivePreload(opts, schema)); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
 // Search handles entity-based, slice-based, or predicate-based queries
 func (ctx *Engine) searchAny(arg any, opts *query.Options) ([]any, error) {
 	argType := reflect.TypeOf(arg)

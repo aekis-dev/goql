@@ -1,7 +1,7 @@
 # Struct calls (by example)
 
-Four calls describe rows with values rather than predicates: `Create`, `Search`, `Write`,
-`Remove`. They are separate from the lambda half so that per-query options attach
+Five calls describe rows with values rather than predicates: `Create`, `Search`, `Get`,
+`Write`, `Remove`. They are separate from the lambda half so that per-query options attach
 unambiguously.
 
 ## Create
@@ -45,11 +45,8 @@ alice, err := goql.Search(ctx, e, Customer{Country: "USA", Name: "Alice"})
 // → WHERE "customers"."country" = ? AND "customers"."name" = ?
 ```
 
-Search by primary key alone:
-
-```go
-one, err := goql.Search(ctx, e, Customer{Model: goql.Model{ID: 42}})
-```
+For a primary key, use [`Get`](#get) instead — `ID` lives on the embedded `goql.Model`, so
+spelling a key as an example means a nested struct literal.
 
 Several examples produce an `IN` per column:
 
@@ -69,6 +66,29 @@ page, err := goql.Search(ctx, e, Customer{Country: "USA"},
     goql.Offset{Value: 40},
     goql.Preload{Fields: []string{"Orders"}},
 )
+```
+
+## Get
+
+By primary key. `ids` is a single key or a slice of them:
+
+```go
+one, err := goql.Get[Customer](ctx, e, 42)
+// → WHERE "id" = ?
+
+some, err := goql.Get[Customer](ctx, e, []int64{1, 2, 3})
+// → WHERE "id" IN (?, ?, ?)
+```
+
+A key that matches nothing is simply absent from the result, so a miss is an empty slice
+rather than an error. The rows come back in whatever order the engine returns them — pass
+`goql.Sort` to fix one.
+
+[Options](options.md) are trailing values, as they are for `Search`, and a model's declared
+`Preload` defaults apply the same way:
+
+```go
+user, err := goql.Get[Customer](ctx, e, userID, goql.Preload{Fields: []string{"Orders"}})
 ```
 
 ## Write

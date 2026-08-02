@@ -1,7 +1,7 @@
 # Llamadas con structs (por ejemplo)
 
-Cuatro llamadas describen filas con valores en lugar de predicados: `Create`, `Search`,
-`Write`, `Remove`. Están separadas de la mitad con lambdas para que las opciones por consulta
+Cinco llamadas describen filas con valores en lugar de predicados: `Create`, `Search`,
+`Get`, `Write`, `Remove`. Están separadas de la mitad con lambdas para que las opciones por consulta
 se asocien sin ambigüedad.
 
 ## Create
@@ -46,11 +46,8 @@ alice, err := goql.Search(ctx, e, Customer{Country: "USA", Name: "Alice"})
 // → WHERE "customers"."country" = ? AND "customers"."name" = ?
 ```
 
-Buscar solo por clave primaria:
-
-```go
-one, err := goql.Search(ctx, e, Customer{Model: goql.Model{ID: 42}})
-```
+Para una clave primaria, usa [`Get`](#get) en su lugar: `ID` vive en el `goql.Model`
+embebido, así que expresar una clave como ejemplo obliga a un literal de struct anidado.
 
 Varios ejemplos producen un `IN` por columna:
 
@@ -70,6 +67,29 @@ page, err := goql.Search(ctx, e, Customer{Country: "USA"},
     goql.Offset{Value: 40},
     goql.Preload{Fields: []string{"Orders"}},
 )
+```
+
+## Get
+
+Por clave primaria. `ids` es una sola clave o un slice de ellas:
+
+```go
+one, err := goql.Get[Customer](ctx, e, 42)
+// → WHERE "id" = ?
+
+some, err := goql.Get[Customer](ctx, e, []int64{1, 2, 3})
+// → WHERE "id" IN (?, ?, ?)
+```
+
+Una clave que no coincide con nada simplemente no aparece en el resultado, así que un fallo
+es un slice vacío y no un error. Las filas vuelven en el orden que decida el motor: pasa
+`goql.Sort` para fijar uno.
+
+Las [opciones](options.md) son valores finales, igual que en `Search`, y los `Preload`
+declarados en el modelo se aplican del mismo modo:
+
+```go
+user, err := goql.Get[Customer](ctx, e, userID, goql.Preload{Fields: []string{"Orders"}})
 ```
 
 ## Write
