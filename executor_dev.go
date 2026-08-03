@@ -1406,6 +1406,19 @@ func (e *DebugExecutor) resolveFieldRef(expr ast.Expr, schema *models.Model, par
 		return nil, fmt.Errorf("could not resolve field path")
 	}
 
+	// A lambda whose parameter type is not a registered model is read as a projection, which
+	// then has no model to resolve against. Reaching here with no schema means the type was
+	// never registered — most often because the package declaring it was not imported, so
+	// its init() never ran AddModel. Without this the parser dereferenced nil and crashed.
+
+	if schema == nil {
+		return nil, fmt.Errorf(
+			"%w: the lambda's parameter type is not a registered model, so %s cannot be "+
+				"resolved — import the package that declares the model so its init() runs "+
+				"models.AddModel, or set from.Model if this is a projection",
+			models.ErrNotRegistered, strings.Join(path, "."))
+	}
+
 	// Simple field: o.Total → path = ["Total"]
 	if len(path) == 1 {
 		field, exists := schema.Fields[path[0]]
@@ -1753,7 +1766,14 @@ func lambdaID(fn any) (runtimeLambdaID, error) {
 // braces inside strings and could not tell apart two literals on the same line.
 func (e *DebugExecutor) locateFuncLit(id runtimeLambdaID, want reflect.Type) (*ast.FuncLit, error) {
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, id.file, nil, parser.SkipObjectResolution)
+	// Source comes from a registered tree when one is embedded, and from disk otherwise, so
+	// the same locator serves a binary that carries its own sources.
+	src, err := readSource(id.file)
+	if err != nil {
+		return nil, fmt.Errorf("goql: failed to read %s: %w", id.file, err)
+	}
+
+	file, err := parser.ParseFile(fset, id.file, src, parser.SkipObjectResolution)
 	if err != nil {
 		return nil, fmt.Errorf("goql: failed to parse %s: %w", id.file, err)
 	}

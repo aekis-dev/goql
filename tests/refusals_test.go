@@ -199,3 +199,26 @@ func TestRefusals_SelfHandleNeedsABinding(t *testing.T) {
 	assertContains(t, err.Error(), "self handle of a recursive query")
 	assertContains(t, err.Error(), "from.Query")
 }
+
+// A lambda whose parameter type is not a registered model used to crash the parser: an
+// unregistered type is read as a projection, the projection has no source model, and
+// resolveFieldRef dereferenced a nil schema.
+//
+// This is not an exotic input. It is what happens when the package declaring the models is
+// not imported, so its init() never runs AddModel — the adoption mistake design.md §5 B4
+// documents. It must report that, not segfault.
+func TestRefusals_UnregisteredModelDoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("parsing panicked instead of reporting an error: %v", r)
+		}
+	}()
+
+	_, err := (&goql.DebugExecutor{}).ParseQueryFromSource(
+		`func(o *NotARegisteredModel) bool { return o.Total > 1 }`, "Select")
+	if err == nil {
+		t.Fatal("expected an unregistered model to be refused")
+	}
+	assertContains(t, err.Error(), "not a registered model")
+	assertContains(t, err.Error(), "AddModel")
+}
